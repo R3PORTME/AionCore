@@ -227,6 +227,21 @@ impl BackendConnection for CodexConnection {
         // run_handshake pre-seeds the binding so the first `turn/start` has a
         // threadId without waiting on the wire. Same wire frames as a wake re-attach
         // (run_handshake is shared with wake_handle).
+        let mut opened_fresh = matches!(
+            &spec,
+            SessionSpec::Fresh { .. }
+                | SessionSpec::Resume {
+                    backend_session_id: None,
+                    ..
+                }
+        );
+        let resume_with_anchor = matches!(
+            &spec,
+            SessionSpec::Resume {
+                backend_session_id: Some(_),
+                ..
+            }
+        );
         let handshake_mode = match &spec {
             SessionSpec::Fresh { .. } => HandshakeMode::Fresh,
             // lost backend session → start fresh under the same logical id (§4.1)
@@ -245,6 +260,28 @@ impl BackendConnection for CodexConnection {
         };
         backend.run_handshake(handshake_mode).await?;
 
+        // A Resume binding is optimistic until the resume RPC itself succeeds.
+        // Confirm it before returning the backend to orchestration. If codex says
+        // the rollout is gone, self-heal immediately to Fresh instead of exposing
+        // a runtime that is "attached" but whose first config write / turn targets
+        // the dead pre-seeded thread id. This is the startup analogue of the
+        // existing first-Send dead-anchor recovery, just moved before admission.
+        if resume_with_anchor {
+            match backend.await_resume_confirmation().await {
+                Ok(()) => {}
+                Err(BackendError::SessionNotFound(reason)) => {
+                    tracing::warn!(
+                        conversation_id = %logical_id,
+                        error = %reason,
+                        "codex resume anchor unavailable during open — starting a fresh thread"
+                    );
+                    backend.recover_dead_resume_as_fresh().await?;
+                    opened_fresh = true;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
         // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
         // (see `thread_start_params`), nor a permission tier (`thread/start` carries no
         // `permissions` field, U1) — the thread launched on codex's own default model +
@@ -257,7 +294,7 @@ impl BackendConnection for CodexConnection {
         // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
         // the two writes deterministic — SetMode no longer depends on current_model
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
-        if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
+        if opened_fresh && (config.model.is_some() || config.mode.is_some()) {
             let backend = Arc::new(backend);
             spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
             return Ok(backend);
@@ -1408,7 +1445,15 @@ impl CodexSessionBackend {
             if let Some(poison) = self.resume_poison.lock().await.clone() {
                 return Err(BackendError::SessionNotFound(poison));
             }
-            if let Some(tid) = self.thread_binding.lock().await.clone() {
+            // A Resume pre-seeds thread_binding before codex has accepted
+            // thread/resume. Do NOT treat that optimistic binding as live while
+            // the resume RPC is still pending: a config write in this window used
+            // to race the eventual "no rollout found" response and target a dead
+            // thread id (the Team fresh-run/app-restart repro).
+            let resume_pending = self.pending_resume.lock().await.is_some();
+            if !resume_pending
+                && let Some(tid) = self.thread_binding.lock().await.clone()
+            {
                 return Ok(tid);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1416,6 +1461,43 @@ impl CodexSessionBackend {
         Err(BackendError::HandshakeTimeout(format!(
             "codex threadId not bound (thread/started not received within {budget:?})"
         )))
+    }
+
+    /// Wait until codex has actually accepted/rejected the in-flight
+    /// `thread/resume`. Resume pre-seeds the binding for wire construction, so
+    /// merely seeing `thread_binding=Some` is not proof the rollout exists.
+    async fn await_resume_confirmation(&self) -> Result<(), BackendError> {
+        let budget = super::handshake_budget();
+        let polls = (budget.as_millis() / 50).max(1) as u64;
+        for _ in 0..polls {
+            if let Some(poison) = self.resume_poison.lock().await.clone() {
+                return Err(BackendError::SessionNotFound(poison));
+            }
+            if self.pending_resume.lock().await.is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Err(BackendError::HandshakeTimeout(format!(
+            "codex thread/resume response not received within {budget:?}"
+        )))
+    }
+
+    /// The persisted anchor can legitimately point at an empty/dead codex rollout
+    /// (e.g. a warmed Team member that never ran a turn before the app restarted).
+    /// Once codex has rejected that resume, start a fresh thread on the SAME
+    /// initialized app-server and wait for a real `thread/started` binding before
+    /// returning. Discovery/skills/init from the first handshake remain valid; only
+    /// the dead thread anchor is replaced.
+    async fn recover_dead_resume_as_fresh(&self) -> Result<(), BackendError> {
+        *self.resume_poison.lock().await = None;
+        *self.pending_resume.lock().await = None;
+        *self.thread_binding.lock().await = None;
+
+        let id = self.next_rpc_id();
+        self.write_frame(thread_start_params(&self.wake.config).into_frame(id, "thread/start"))
+            .await?;
+        self.bound_thread_within(super::handshake_budget()).await.map(|_| ())
     }
 
     /// Replay the JSON-RPC handshake over the (already-connected) stdin: an
@@ -9052,6 +9134,75 @@ mod tests {
         assert!(
             terminals[0].0 && terminals[0].1.contains("turn rejected"),
             "the terminal is is_error and carries the codex message verbatim, got {terminals:?}"
+        );
+    }
+
+    /// A pre-seeded Resume binding is NOT usable until codex accepts the
+    /// resume RPC. This closes the startup race where an immediate effort/model
+    /// write targeted a dead thread before the rejection arrived.
+    #[tokio::test]
+    async fn bound_thread_waits_for_resume_confirmation_before_using_preseed() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = CodexSessionBackend::build_with_io("codex-resume-pending", Box::new(fake)).await;
+        backend.seed_thread_binding_for_test("th-optimistic").await;
+        backend.register_pending_resume_for_test(7).await;
+
+        let binding = backend.thread_binding.clone();
+        let pending = backend.pending_resume.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            *pending.lock().await = None;
+            // Keep the same pre-seeded id: success means it is now authoritative.
+            assert_eq!(binding.lock().await.as_deref(), Some("th-optimistic"));
+        });
+
+        let started = tokio::time::Instant::now();
+        let got = backend
+            .bound_thread_within(std::time::Duration::from_secs(1))
+            .await
+            .expect("resume confirmation makes the pre-seeded binding usable");
+        assert_eq!(got, "th-optimistic");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "bound_thread must not return the optimistic resume id before confirmation"
+        );
+    }
+
+    /// Exact Team restart failure class: codex rejects an empty/dead persisted
+    /// rollout. The open path must be able to replace it with a fresh thread
+    /// before config replay/admission proceeds.
+    #[tokio::test]
+    async fn dead_resume_recovery_starts_fresh_and_waits_for_new_binding() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-resume-fallback", Box::new(fake)).await;
+        *backend.resume_poison.lock().await = Some("codex thread/resume failed: no rollout found".into());
+        backend.seed_thread_binding_for_test("th-dead").await;
+
+        let binding = backend.thread_binding.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            *binding.lock().await = Some("th-fresh".into());
+        });
+
+        backend
+            .recover_dead_resume_as_fresh()
+            .await
+            .expect("dead resume self-heals to a fresh bound thread");
+
+        assert_eq!(
+            backend.thread_binding.lock().await.as_deref(),
+            Some("th-fresh"),
+            "recovery must leave the fresh authoritative binding"
+        );
+        assert!(
+            backend.resume_poison.lock().await.is_none(),
+            "fresh recovery clears the dead-resume poison"
+        );
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"thread/start""#),
+            "dead-resume recovery must issue thread/start, got: {written}"
         );
     }
 
