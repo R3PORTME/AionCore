@@ -2375,6 +2375,12 @@ impl TeamSessionService {
         workspace: &str,
     ) -> Result<TeamFreshRunResponse, TeamError> {
         let workspace = validate_create_workspace_path(workspace)?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let membership_guard = membership_lock.lock().await;
         let team = self.load_owned_team(user_id, team_id).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
@@ -2431,6 +2437,9 @@ impl TeamSessionService {
             "team fresh run prepared"
         );
 
+        // ensure_session acquires the same membership lock while rebuilding the
+        // runtime, so release the mutation guard before entering that path.
+        drop(membership_guard);
         self.ensure_session(user_id, team_id).await?;
 
         Ok(TeamFreshRunResponse {
