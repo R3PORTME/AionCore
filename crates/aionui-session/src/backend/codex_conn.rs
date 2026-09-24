@@ -271,7 +271,7 @@ impl BackendConnection for CodexConnection {
                 Ok(()) => {}
                 Err(BackendError::SessionNotFound(reason)) => {
                     tracing::warn!(
-                        conversation_id = %logical_id,
+                        conversation_id = %backend.session_id,
                         error = %reason,
                         "codex resume anchor unavailable during open — starting a fresh thread"
                     );
