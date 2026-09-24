@@ -2406,7 +2406,7 @@ impl TeamSessionService {
                 cleared_context_anchors += 1;
             }
             self.conversation_port
-                .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace }))
+                .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace.clone() }))
                 .await?;
         }
 

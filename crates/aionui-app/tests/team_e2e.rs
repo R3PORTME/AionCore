@@ -1788,9 +1788,10 @@ async fn fresh_run_rebinds_workspace_and_clears_team_state() {
     sqlx::query(
         "INSERT INTO team_tasks \
          (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
-         VALUES ('fresh-run-task', ?, 'Old task', 'Old issue', 'completed', NULL, '[]', '[]', '{}', 10, 20)",
+         VALUES ('fresh-run-task', ?, 'Old task', 'Old issue', 'completed', ?, '[]', '[]', '{}', 10, 20)",
     )
     .bind(team_id)
+    .bind(data["assistants"][0]["slot_id"].as_str().unwrap())
     .execute(services.database.pool())
     .await
     .unwrap();
@@ -1801,7 +1802,7 @@ async fn fresh_run_rebinds_workspace_and_clears_team_state() {
     let fresh = json_with_token(
         "POST",
         &format!("/api/teams/{team_id}/fresh-run"),
-        json!({ "workspace": workspace_string }),
+        json!({ "workspace": workspace_string.clone() }),
         &token,
         &csrf,
     );
@@ -1839,6 +1840,36 @@ async fn fresh_run_rebinds_workspace_and_clears_team_state() {
     assert_eq!(task_count, 0);
 
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn fresh_run_requires_authentication() {
+    let (app, _) = build_app().await;
+    let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/nonexistent/fresh-run")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn fresh_run_requires_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/nonexistent/fresh-run")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 async fn conversation_extra(services: &aionui_app::AppServices, conversation_id: &str) -> Value {
