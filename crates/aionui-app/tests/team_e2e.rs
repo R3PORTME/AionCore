@@ -1527,6 +1527,159 @@ async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
 }
 
 #[tokio::test]
+async fn fresh_start_rebinds_workspace_clears_team_work_and_resets_all_provider_contexts() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let agents = data["assistants"].as_array().unwrap();
+
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('fresh-start-message', ?, ?, 'lead-slot', 'message', 'stale issue context', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(agents[1]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('fresh-start-task', ?, 'Old issue', 'stale task', 'pending', NULL, '[]', '[]', '{}', 10, 20)",
+    )
+    .bind(team_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let new_workspace = tempfile::TempDir::new().unwrap();
+    let workspace = new_workspace.path().to_string_lossy().to_string();
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-start"),
+        json!({ "workspace": workspace }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "fresh start should succeed: {body}");
+    assert_eq!(body["data"]["workspace"], workspace);
+
+    for agent in agents {
+        let conversation_id = agent["conversation_id"].as_str().unwrap();
+        let extra = conversation_extra(&services, conversation_id).await;
+        assert_eq!(extra["workspace"], workspace);
+        assert!(extra["mock_acp_session_id"].is_null());
+    }
+
+    let team_binding: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT project_id, folder_id FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_one(services.database.pool())
+            .await
+            .unwrap();
+    assert!(team_binding.0.is_some(), "fresh workspace should resolve a Team project binding");
+    assert!(team_binding.1.is_some(), "fresh workspace should resolve a Team folder binding");
+
+    for agent in agents {
+        let conversation_id = agent["conversation_id"].as_str().unwrap();
+        let conversation_binding: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT project_id, folder_id FROM conversations WHERE id = ?")
+                .bind(conversation_id)
+                .fetch_one(services.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(conversation_binding, team_binding);
+    }
+
+    let mailbox_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(mailbox_count.0, 0);
+    assert_eq!(task_count.0, 0);
+}
+
+#[tokio::test]
+async fn fresh_start_rejects_unavailable_workspace_before_mutating_team() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let old_workspace = data["workspace"].as_str().unwrap().to_owned();
+    let root = tempfile::TempDir::new().unwrap();
+    let missing_workspace = root.path().join("missing-worktree");
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-start"),
+        json!({ "workspace": missing_workspace.to_string_lossy() }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let snapshot = app
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let body = body_json(snapshot).await;
+    assert_eq!(body["data"]["workspace"], old_workspace);
+}
+
+#[tokio::test]
+async fn fresh_start_rejects_missing_csrf() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/teams/{team_id}/fresh-start"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({ "workspace": workspace.path().to_string_lossy() }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn fresh_start_requires_authentication() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/teams/{team_id}/fresh-start"))
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(
+            json!({ "workspace": workspace.path().to_string_lossy() }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn context_reset_rejects_leader_through_the_http_contract() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

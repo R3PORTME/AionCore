@@ -106,6 +106,15 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
+    async fn rebind_project_for_workspace(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _workspace: &str,
+    ) -> Result<bool, TeamError> {
+        Ok(false)
+    }
+
     async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
         self.patch_runtime_config(conversation_id, serde_json::json!({ "current_model_id": model }))
             .await

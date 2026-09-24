@@ -110,6 +110,16 @@ pub struct CreateTeamRequest {
     pub workspace: Option<String>,
 }
 
+/// Request body for `POST /api/teams/:id/fresh-start`.
+///
+/// Reuses the persisted Team roster while moving all member runtimes to a
+/// clean ACP provider session rooted at the supplied workspace.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshStartTeamRequest {
+    pub workspace: String,
+}
+
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameTeamRequest {
@@ -1042,6 +1052,19 @@ mod tests {
         let raw = json!({ "name": "Team" });
         let result = serde_json::from_value::<CreateTeamRequest>(raw);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_fresh_start_team_request() {
+        let raw = json!({ "workspace": "/tmp/issue-123" });
+        let req: FreshStartTeamRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.workspace, "/tmp/issue-123");
+    }
+
+    #[test]
+    fn deserialize_fresh_start_team_request_rejects_unknown_fields() {
+        let raw = json!({ "workspace": "/tmp/issue-123", "keep_old_context": true });
+        assert!(serde_json::from_value::<FreshStartTeamRequest>(raw).is_err());
     }
 
     #[test]
