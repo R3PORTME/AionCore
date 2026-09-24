@@ -969,10 +969,11 @@ struct Discovered {
     modes: Vec<crate::capability::ModeInfo>,
     /// Last effort reported by `thread/settings/updated`.
     ///
-    /// Codex emits this independently of model/mode. Keeping it beside the
-    /// handshake-discovered catalog gives the synchronous `capabilities()`
-    /// snapshot an authoritative live value after session rebuilds, instead of
-    /// relying on the conversation layer's ephemeral optimistic override.
+    /// Verified contract: `samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json`;
+    /// also live-reproduced with codex-cli 0.156.1 during the Team fresh-run probe.
+    /// Keeping it beside the handshake-discovered catalog gives the synchronous
+    /// `capabilities()` snapshot an authoritative live value after session rebuilds,
+    /// instead of relying on the conversation layer's ephemeral optimistic override.
     current_effort: Option<String>,
 }
 
