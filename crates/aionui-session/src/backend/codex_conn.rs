@@ -1451,9 +1451,7 @@ impl CodexSessionBackend {
             // to race the eventual "no rollout found" response and target a dead
             // thread id (the Team fresh-run/app-restart repro).
             let resume_pending = self.pending_resume.lock().await.is_some();
-            if !resume_pending
-                && let Some(tid) = self.thread_binding.lock().await.clone()
-            {
+            if !resume_pending && let Some(tid) = self.thread_binding.lock().await.clone() {
                 return Ok(tid);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
