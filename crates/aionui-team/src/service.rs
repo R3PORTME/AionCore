@@ -12,8 +12,9 @@ use aionui_api_types::{
     AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
     InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunResponse,
+    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamSessionBinding,
     TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
@@ -2365,6 +2366,78 @@ impl TeamSessionService {
     #[cfg(test)]
     fn session_count_for_test(&self) -> usize {
         self.sessions.len()
+    }
+
+    pub async fn fresh_run(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        workspace: &str,
+    ) -> Result<TeamFreshRunResponse, TeamError> {
+        let workspace = validate_create_workspace_path(workspace)?;
+        let team = self.load_owned_team(user_id, team_id).await?;
+
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            let has_active_run = session.team_run_manager().current_active_run_id().is_some();
+            let has_slot_work = team.agents.iter().any(|agent| {
+                session.work_coordinator().slot_snapshot(&agent.slot_id).is_some_and(|slot| {
+                    slot.active_batch.is_some()
+                        || slot.queued_foreground_count > 0
+                        || slot.queued_background_count > 0
+                })
+            });
+            if has_active_run || has_slot_work {
+                return Err(TeamError::InvalidRequest(
+                    "team has active work; finish or cancel it before starting a fresh run".to_owned(),
+                ));
+            }
+        }
+
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamContextReset)
+            .await;
+
+        let mut cleared_context_anchors = 0usize;
+        for agent in &team.agents {
+            if self
+                .conversation_port
+                .clear_context_anchor(user_id, &agent.conversation_id)
+                .await?
+            {
+                cleared_context_anchors += 1;
+            }
+            self.conversation_port
+                .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace }))
+                .await?;
+        }
+
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    workspace: Some(workspace.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
+        self.repo.delete_tasks_by_team(user_id, team_id).await?;
+
+        info!(
+            team_id,
+            member_count = team.agents.len(),
+            cleared_context_anchors,
+            workspace = %workspace,
+            "team fresh run prepared"
+        );
+
+        self.ensure_session(user_id, team_id).await?;
+
+        Ok(TeamFreshRunResponse {
+            workspace,
+            member_count: team.agents.len(),
+            cleared_context_anchors,
+        })
     }
 
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {

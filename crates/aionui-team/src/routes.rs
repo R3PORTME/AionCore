@@ -14,8 +14,9 @@ use aionui_api_types::{
     GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    TeamContextResetResponse, TeamFreshRunRequest, TeamFreshRunResponse, TeamInterruptAgentResponse,
+    TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -224,6 +225,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/pause",
             post(pause_slot_work),
         )
+        .route("/api/teams/{id}/fresh-run", post(fresh_run))
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
         .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
@@ -613,6 +615,17 @@ async fn active_lease(
         .renew_active_lease(&user.id, &id, &state.active_leases)
         .await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn fresh_run(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<TeamFreshRunRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamFreshRunResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let outcome = state.service.fresh_run(&user.id, &id, &req.workspace).await?;
+    Ok(Json(ApiResponse::ok(outcome)))
 }
 
 async fn ensure_session(
