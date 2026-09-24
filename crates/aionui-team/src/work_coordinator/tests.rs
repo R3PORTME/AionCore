@@ -139,7 +139,9 @@ fn fresh_run_quiesce_rejects_pending_enqueue_lease_without_mutating_slot() {
     let error = coordinator.quiesce_for_fresh_run().unwrap_err();
     assert!(error.to_string().contains("active or pending work"));
 
-    let committed = coordinator.commit_enqueue(&lease, None).unwrap();
+    let committed = coordinator
+        .commit_enqueue(&lease, Some("user-message-1".into()))
+        .unwrap();
     assert_eq!(committed.disposition, EnqueueDisposition::Accepted);
 }
 
