@@ -283,7 +283,7 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_task_list"));
         assert!(prompt.contains("team_rename_agent"));
-        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("Call `team_read_messages` once near the start of each active Team turn"));
         assert!(prompt.contains("`since_message_id`"));
         assert!(prompt.contains("`content_truncated: true`"));
     }
