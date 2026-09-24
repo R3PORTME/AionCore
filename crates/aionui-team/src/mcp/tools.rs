@@ -86,6 +86,7 @@ pub struct TaskCreateInput {
     pub subject: String,
     pub description: Option<String>,
     pub owner: Option<String>,
+    pub owner_name: Option<String>,
     pub blocked_by: Option<Vec<String>>,
 }
 
@@ -95,6 +96,7 @@ pub struct TaskUpdateInput {
     pub status: Option<String>,
     pub description: Option<String>,
     pub owner: Option<String>,
+    pub owner_name: Option<String>,
     pub blocked_by: Option<Vec<String>>,
 }
 

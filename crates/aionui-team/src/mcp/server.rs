@@ -770,6 +770,47 @@ async fn resolve_agent_target(
     }
 }
 
+fn resolve_task_owner_from_agents(
+    agents: &[TeamAgent],
+    owner: Option<&str>,
+    owner_name: Option<&str>,
+) -> Result<Option<String>, ToolCallError> {
+    match (owner, owner_name) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(ToolCallError::from_message(
+            "Invalid params: owner_name is required when owner is provided",
+        )),
+        (None, Some(_)) => Err(ToolCallError::from_message(
+            "Invalid params: owner is required when owner_name is provided",
+        )),
+        (Some(slot_id), Some(display_name)) => {
+            let agent = agents.iter().find(|agent| agent.slot_id == slot_id).ok_or_else(|| {
+                ToolCallError::from_message(format!(
+                    "Invalid agent target '{slot_id}': expected current teammate slot_id. Call team_members to refresh the roster."
+                ))
+            })?;
+            let expected_name = crate::scheduler::normalize_name(&agent.name);
+            let provided_name = crate::scheduler::normalize_name(display_name);
+            if provided_name.is_empty() || provided_name != expected_name {
+                return Err(ToolCallError::from_message(format!(
+                    "Invalid params: owner_name '{display_name}' does not match owner slot_id '{slot_id}' (current display name '{}')",
+                    agent.name
+                )));
+            }
+            Ok(Some(slot_id.to_owned()))
+        }
+    }
+}
+
+async fn resolve_task_owner(
+    scheduler: &TeammateManager,
+    owner: Option<&str>,
+    owner_name: Option<&str>,
+) -> Result<Option<String>, ToolCallError> {
+    let agents = scheduler.list_agents().await;
+    resolve_task_owner_from_agents(&agents, owner, owner_name)
+}
+
 async fn exec_send_message(
     args: &Value,
     scheduler: &TeammateManager,
@@ -1171,11 +1212,13 @@ async fn exec_task_create(
     let input: TaskCreateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
+    let owner = resolve_task_owner(scheduler, input.owner.as_deref(), input.owner_name.as_deref()).await?;
+
     let task = scheduler
         .create_task(
             &input.subject,
             input.description.as_deref(),
-            input.owner.as_deref(),
+            owner.as_deref(),
             &input.blocked_by.unwrap_or_default(),
         )
         .await
@@ -1198,7 +1241,8 @@ async fn exec_task_update(
     let input: TaskUpdateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let reassigned = input.owner.is_some();
+    let owner = resolve_task_owner(scheduler, input.owner.as_deref(), input.owner_name.as_deref()).await?;
+    let reassigned = owner.is_some();
     let completed = input.status.as_deref() == Some("completed");
 
     let task = scheduler
@@ -1206,7 +1250,7 @@ async fn exec_task_update(
             &input.task_id,
             input.status.as_deref(),
             input.description,
-            input.owner,
+            owner,
             input.blocked_by,
         )
         .await
@@ -1605,6 +1649,49 @@ mod tests {
 
     fn render(messages: Vec<MailboxMessage>, since_message_id: Option<&str>) -> RenderedInbox {
         render_inbox_page(inbox_page(messages, since_message_id).expect("page builds"))
+    }
+
+    fn teammate(slot_id: &str, name: &str) -> TeamAgent {
+        TeamAgent {
+            slot_id: slot_id.to_owned(),
+            name: name.to_owned(),
+            role: TeammateRole::Teammate,
+            conversation_id: format!("conversation-{slot_id}"),
+            backend: "acp".into(),
+            model: "test-model".into(),
+            assistant_id: Some(format!("assistant-{slot_id}")),
+            status: Some(TeammateStatus::Idle),
+            conversation_type: None,
+            cli_path: None,
+        }
+    }
+
+    #[test]
+    fn task_owner_identity_accepts_matching_slot_and_display_name() {
+        let agents = vec![teammate("slot-luna", "Codex Coder Luna")];
+        let owner = resolve_task_owner_from_agents(&agents, Some("slot-luna"), Some("Codex Coder Luna"))
+            .expect("matching identity pair should resolve");
+        assert_eq!(owner.as_deref(), Some("slot-luna"));
+    }
+
+    #[test]
+    fn task_owner_identity_rejects_wrong_valid_slot_for_requested_name() {
+        let agents = vec![
+            teammate("slot-sol", "Codex Coder Sol"),
+            teammate("slot-claude", "Claude Code"),
+        ];
+        let error = resolve_task_owner_from_agents(&agents, Some("slot-sol"), Some("Claude Code"))
+            .expect_err("slot/name mismatch must fail closed");
+        assert!(error.message.starts_with("Invalid params:"));
+        assert!(error.message.contains("does not match"));
+    }
+
+    #[test]
+    fn task_owner_identity_requires_both_fields_when_assigning() {
+        let agents = vec![teammate("slot-luna", "Codex Coder Luna")];
+        assert!(resolve_task_owner_from_agents(&agents, Some("slot-luna"), None).is_err());
+        assert!(resolve_task_owner_from_agents(&agents, None, Some("Codex Coder Luna")).is_err());
+        assert_eq!(resolve_task_owner_from_agents(&agents, None, None).unwrap(), None);
     }
 
     #[test]

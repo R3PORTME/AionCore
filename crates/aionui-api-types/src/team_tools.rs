@@ -331,7 +331,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamReadMessages,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet.",
+            description: "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. Do not use this tool as a wait/poll primitive: repeated reads in the same turn may return the same rows because acknowledgement is committed only when the turn completes successfully. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -390,26 +390,27 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamTaskCreate,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Create a new task on the team task board.",
+            description: "Create a new task on the team task board. When assigning an owner, provide both owner (the exact slot_id) and owner_name (the current display name from team_members). The backend rejects missing or mismatched identity pairs instead of silently assigning the wrong teammate.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "subject": { "type": "string", "description": "Task subject" },
                     "description": { "type": "string", "description": "Task description" },
-                    "owner": { "type": "string", "description": "Owning agent slotId" },
+                    "owner": { "type": "string", "description": "Owning agent slot_id; when present, owner_name is also required" },
+                    "owner_name": { "type": "string", "description": "Current display name for owner; must match the owner slot_id" },
                     "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Task IDs this task depends on" }
                 },
                 "required": ["subject"]
             }),
             cli_command: &["task", "create"],
             when: "Create task",
-            input_summary: "subject, optional owner/deps",
+            input_summary: "subject, optional owner+owner_name/deps",
         },
         TeamToolSpec {
             name: TeamToolName::TeamTaskUpdate,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Update an existing task on the team task board.",
+            description: "Update an existing task on the team task board. When changing owner, provide both owner (the exact slot_id) and owner_name (the current display name from team_members); mismatched pairs are rejected.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -417,14 +418,15 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                     "task_id": { "type": "string", "description": "Task ID to update" },
                     "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "deleted"], "description": "New status" },
                     "description": { "type": "string", "description": "New description" },
-                    "owner": { "type": "string", "description": "New owning agent slotId" },
+                    "owner": { "type": "string", "description": "New owning agent slot_id; when present, owner_name is also required" },
+                    "owner_name": { "type": "string", "description": "Current display name for the new owner; must match owner" },
                     "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
                 },
                 "required": ["task_id"]
             }),
             cli_command: &["task", "update"],
             when: "Update task",
-            input_summary: "task_id, optional status/owner/deps",
+            input_summary: "task_id, optional status/owner+owner_name/deps",
         },
         TeamToolSpec {
             name: TeamToolName::TeamTaskList,
@@ -664,6 +666,24 @@ mod tests {
             descriptor.description.contains("redelivered in full"),
             "truncated messages must be documented as previews that stay unread"
         );
+        assert!(
+            descriptor.description.contains("wait/poll"),
+            "read_messages must explicitly forbid same-turn polling"
+        );
+    }
+
+    #[test]
+    fn task_assignment_schema_exposes_owner_identity_checksum() {
+        for tool in ["team_task_create", "team_task_update"] {
+            let descriptor = team_tool_descriptor(tool).expect("task descriptor");
+            let properties = descriptor.input_schema["properties"].as_object().unwrap();
+            assert!(properties.contains_key("owner"));
+            assert!(properties.contains_key("owner_name"));
+            assert!(
+                descriptor.description.contains("mismatch") || descriptor.description.contains("mismatched"),
+                "task assignment must document fail-closed owner identity validation"
+            );
+        }
     }
 
     #[test]
