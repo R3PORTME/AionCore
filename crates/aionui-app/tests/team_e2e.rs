@@ -1844,12 +1844,15 @@ async fn fresh_run_rebinds_workspace_and_clears_team_state() {
 
 #[tokio::test]
 async fn fresh_run_requires_authentication() {
-    let (app, _) = build_app().await;
+    let (mut app, services) = build_app().await;
+    let (_, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
     let req = axum::http::Request::builder()
         .method("POST")
         .uri("/api/teams/nonexistent/fresh-run")
         .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
         .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
