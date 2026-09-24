@@ -1424,6 +1424,35 @@ impl SlotWorkCoordinator {
         }
     }
 
+    /// Atomically refuse a fresh-run transition unless the coordinator is
+    /// completely idle, then close the enqueue choke-point before teardown.
+    ///
+    /// The idle check and SessionStopped transition share the same state mutex
+    /// as acquire_enqueue(), so either an enqueue lease/work intent wins and
+    /// fresh-run is rejected, or fresh-run wins and all later user/agent/system
+    /// enqueues are rejected until the TeamSession is rebuilt.
+    pub(crate) fn quiesce_for_fresh_run(&self) -> Result<(), TeamError> {
+        let mut state = self.lock_state();
+        let has_work = !state.enqueue_leases.is_empty()
+            || state.intents.values().any(|intent| !intent.state.is_terminal())
+            || state.slots.values().any(|slot| {
+                matches!(
+                    slot.runtime_constraint,
+                    RuntimeConstraint::Starting { .. } | RuntimeConstraint::Removing { .. }
+                )
+            });
+        if has_work {
+            return Err(TeamError::InvalidRequest(
+                "team has active or pending work; finish or cancel it before starting a fresh run".to_owned(),
+            ));
+        }
+
+        for slot in state.slots.values_mut() {
+            slot.runtime_constraint = RuntimeConstraint::SessionStopped;
+        }
+        Ok(())
+    }
+
     pub(crate) fn stop(&self) -> Vec<RunWorkSummary> {
         let mut state = self.lock_state();
         let run_ids = Self::all_run_ids(&state);

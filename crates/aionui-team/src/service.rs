@@ -2464,26 +2464,12 @@ impl TeamSessionService {
         let team = self.load_owned_team(user_id, team_id).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
-            let has_active_run = session.team_run_manager().current_active_run_id().is_some();
-            let has_slot_work = team.agents.iter().any(|agent| {
-                session
-                    .work_coordinator()
-                    .slot_snapshot(&agent.slot_id)
-                    .is_some_and(|slot| {
-                        slot.active_batch.is_some()
-                            || slot.queued_foreground_count > 0
-                            || slot.queued_background_count > 0
-                            || matches!(
-                                slot.runtime_constraint,
-                                RuntimeConstraint::Starting { .. } | RuntimeConstraint::Removing { .. }
-                            )
-                    })
-            });
-            if has_active_run || has_slot_work {
+            if session.team_run_manager().current_active_run_id().is_some() {
                 return Err(TeamError::InvalidRequest(
-                    "team has active work; finish or cancel it before starting a fresh run".to_owned(),
+                    "team has an active run; finish or cancel it before starting a fresh run".to_owned(),
                 ));
             }
+            session.work_coordinator().quiesce_for_fresh_run()?;
         }
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamContextReset)

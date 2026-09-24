@@ -106,6 +106,44 @@ fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
 }
 
 #[test]
+fn fresh_run_quiesce_blocks_new_enqueue_when_idle() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+
+    coordinator.quiesce_for_fresh_run().unwrap();
+
+    let error = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("session stopped"));
+}
+
+#[test]
+fn fresh_run_quiesce_rejects_pending_enqueue_lease_without_mutating_slot() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .unwrap();
+
+    let error = coordinator.quiesce_for_fresh_run().unwrap_err();
+    assert!(error.to_string().contains("active or pending work"));
+
+    let committed = coordinator.commit_enqueue(&lease, None).unwrap();
+    assert_eq!(committed.disposition, EnqueueDisposition::Accepted);
+}
+
+#[test]
 fn priority_lanes_claim_foreground_then_control_then_directed_then_background() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
