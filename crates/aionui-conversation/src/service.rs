@@ -486,15 +486,24 @@ impl ConversationService {
         conversation_id: &str,
         workspace_path: &str,
     ) -> Result<bool, ConversationError> {
-        self.conversation_repo
+        let existing = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
-        Ok(self
+        let applied = self
             .bind_project_best_effort(user_id, conversation_id, workspace_path)
-            .await)
+            .await;
+        if applied {
+            let source = existing
+                .source
+                .as_deref()
+                .and_then(|value| string_to_enum::<ConversationSource>(value).ok());
+            self.broadcast_list_changed(user_id, conversation_id, "updated", source.as_ref());
+        }
+        Ok(applied)
     }
 
     async fn bind_project_best_effort(&self, user_id: &str, conversation_id: &str, workspace_path: &str) -> bool {
