@@ -4,6 +4,7 @@ pub(crate) mod spawn_support;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
@@ -116,6 +117,20 @@ struct SessionEntry {
     slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
 
+struct TeamLifecycleGate {
+    lock: Arc<tokio::sync::RwLock<()>>,
+    generation: AtomicU64,
+}
+
+impl Default for TeamLifecycleGate {
+    fn default() -> Self {
+        Self {
+            lock: Arc::new(tokio::sync::RwLock::new(())),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
 pub struct TeamIdleCleanupCoordinator {
     service: Arc<TeamSessionService>,
     active_leases: Arc<ActiveLeaseRegistry>,
@@ -166,6 +181,11 @@ pub struct TeamSessionService {
     backend_binary_path: Arc<PathBuf>,
     prompt_dump: TeamPromptDumpConfig,
     sessions: Arc<DashMap<String, SessionEntry>>,
+    /// Per-team lifecycle barrier. Normal work uses a shared admission guard;
+    /// fresh-run takes the exclusive guard and changes the generation so a
+    /// request that waited across an Issue boundary is rejected instead of
+    /// continuing in the rebuilt runtime.
+    lifecycle_gates: Arc<DashMap<String, Arc<TeamLifecycleGate>>>,
     /// Per-team mutex serializing membership mutations with session startup so
     /// callers cannot read-modify-write the `agents` JSON or rebuild a runtime
     /// session from a stale roster snapshot.
@@ -301,12 +321,43 @@ impl TeamSessionService {
             backend_binary_path,
             prompt_dump,
             sessions: Arc::new(DashMap::new()),
+            lifecycle_gates: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
+    }
+
+    fn lifecycle_gate(&self, team_id: &str) -> Arc<TeamLifecycleGate> {
+        self.lifecycle_gates
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(TeamLifecycleGate::default()))
+            .clone()
+    }
+
+    async fn acquire_lifecycle_admission(
+        &self,
+        team_id: &str,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, TeamError> {
+        let gate = self.lifecycle_gate(team_id);
+        let observed_generation = gate.generation.load(Ordering::Acquire);
+        if observed_generation % 2 != 0 {
+            return Err(TeamError::InvalidRequest(
+                "team fresh run is in progress; retry after it completes".to_owned(),
+            ));
+        }
+
+        let guard = Arc::clone(&gate.lock).read_owned().await;
+        let current_generation = gate.generation.load(Ordering::Acquire);
+        if current_generation != observed_generation || current_generation % 2 != 0 {
+            drop(guard);
+            return Err(TeamError::InvalidRequest(
+                "team lifecycle changed while the request was waiting; retry the request".to_owned(),
+            ));
+        }
+        Ok(guard)
     }
 
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
@@ -2373,6 +2424,27 @@ impl TeamSessionService {
         team_id: &str,
         workspace: &str,
     ) -> Result<TeamFreshRunResponse, TeamError> {
+        let gate = self.lifecycle_gate(team_id);
+        let _lifecycle_guard = Arc::clone(&gate.lock).write_owned().await;
+        let previous_generation = gate.generation.fetch_add(1, Ordering::AcqRel);
+        if previous_generation % 2 != 0 {
+            gate.generation.fetch_add(1, Ordering::AcqRel);
+            return Err(TeamError::InvalidRequest(
+                "team lifecycle generation was already resetting".to_owned(),
+            ));
+        }
+
+        let result = self.fresh_run_inner(user_id, team_id, workspace).await;
+        gate.generation.fetch_add(1, Ordering::AcqRel);
+        result
+    }
+
+    async fn fresh_run_inner(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        workspace: &str,
+    ) -> Result<TeamFreshRunResponse, TeamError> {
         let workspace = validate_create_workspace_path(workspace)?;
         let membership_lock = self
             .add_agent_locks
@@ -2392,6 +2464,10 @@ impl TeamSessionService {
                         slot.active_batch.is_some()
                             || slot.queued_foreground_count > 0
                             || slot.queued_background_count > 0
+                            || matches!(
+                                slot.runtime_constraint,
+                                RuntimeConstraint::Starting { .. } | RuntimeConstraint::Removing { .. }
+                            )
                     })
             });
             if has_active_run || has_slot_work {
@@ -2442,10 +2518,11 @@ impl TeamSessionService {
             "team fresh run prepared"
         );
 
-        // ensure_session acquires the same membership lock while rebuilding the
-        // runtime, so release the mutation guard before entering that path.
+        // Keep the lifecycle barrier held across rebuild, but release the
+        // membership lock before ensure_session_inner reacquires it. The lock
+        // order is lifecycle -> membership, so this path cannot self-deadlock.
         drop(membership_guard);
-        self.ensure_session(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
 
         Ok(TeamFreshRunResponse {
             workspace,
