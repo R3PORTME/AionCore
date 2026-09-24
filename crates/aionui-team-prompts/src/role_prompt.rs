@@ -382,7 +382,7 @@ mod tests {
         assert!(prompt.to_lowercase().contains("first team turn"));
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
-        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("Call `team_read_messages` once near the start of each active Team turn"));
         assert!(prompt.contains("`next_since_message_id`"));
         assert!(prompt.contains("Do NOT poll with repeated"));
         assert!(prompt.contains("End the current turn immediately"));
