@@ -14,8 +14,7 @@ use aionui_api_types::{
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
     TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunResponse,
     TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
@@ -2386,11 +2385,14 @@ impl TeamSessionService {
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
             let has_active_run = session.team_run_manager().current_active_run_id().is_some();
             let has_slot_work = team.agents.iter().any(|agent| {
-                session.work_coordinator().slot_snapshot(&agent.slot_id).is_some_and(|slot| {
-                    slot.active_batch.is_some()
-                        || slot.queued_foreground_count > 0
-                        || slot.queued_background_count > 0
-                })
+                session
+                    .work_coordinator()
+                    .slot_snapshot(&agent.slot_id)
+                    .is_some_and(|slot| {
+                        slot.active_batch.is_some()
+                            || slot.queued_foreground_count > 0
+                            || slot.queued_background_count > 0
+                    })
             });
             if has_active_run || has_slot_work {
                 return Err(TeamError::InvalidRequest(
@@ -2412,7 +2414,10 @@ impl TeamSessionService {
                 cleared_context_anchors += 1;
             }
             self.conversation_port
-                .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace.clone() }))
+                .patch_runtime_config(
+                    &agent.conversation_id,
+                    serde_json::json!({ "workspace": workspace.clone() }),
+                )
                 .await?;
         }
 
