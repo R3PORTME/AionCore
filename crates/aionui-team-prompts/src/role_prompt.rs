@@ -27,8 +27,9 @@ yourself, you may do that directly.${workspaceSection}
 
 Your first team turn must call `team_members` to get the current roster. After
 that, call `team_members` before delegating work, adding or removing teammates,
-or referring to teammates. Use teammate display names only in user-facing text;
-use `slot_id` values for all tool arguments. Use `team_task_list` when you need
+or referring to teammates. Use `slot_id` values for agent target fields. The
+task-assignment `owner_name` field is an identity checksum and must carry the
+current display name from `team_members`. Use `team_task_list` when you need
 current task state.
 Call `team_read_messages` once near the start of each active Team turn before assigning work or replying to teammates. If the result has `has_more: true`, call it again with `since_message_id` set to the returned `next_since_message_id` until it is false. Do not call `team_read_messages`, `team_members`, or `team_task_list` repeatedly in the same turn merely to wait for a teammate. Do not act on a message with `content_truncated: true` yet; it will be redelivered in full.
 
@@ -260,10 +261,12 @@ Leader: {{LEADER_NAME}} (slot_id: {{LEADER_SLOT_ID}}){{WORKSPACE}}
 {{TEAM_TOOL_USAGE}}
 
 Use `team_task_list` and `team_members` to check current team state.
-Display names are only for user-facing text. For tool arguments such as
+Display names are not agent targets. For target fields such as
 `team_send_message.to`, `team_rename_agent.slot_id`, and
 `team_shutdown_agent.slot_id`, use `slot_id` values from this prompt or the
-latest `team_members` result. Never pass display names as agent targets.
+latest `team_members` result. The task-assignment `owner_name` field is the
+exception: it is an identity checksum paired with `owner=<slot_id>`, not a
+target field. Never pass a display name where a slot_id target is required.
 Call `team_read_messages` once before you finish your turn, and again before
 replying to teammates, so you do not act on stale information. If the result has
 `has_more: true`, call it again with `since_message_id` set to the returned
@@ -382,6 +385,7 @@ mod tests {
         assert!(prompt.to_lowercase().contains("first team turn"));
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
+        assert!(prompt.contains("owner_name` field is an identity checksum"));
         assert!(prompt.contains("Call `team_read_messages` once near the start of each active Team turn"));
         assert!(prompt.contains("`next_since_message_id`"));
         assert!(prompt.contains("Do NOT poll with repeated"));
@@ -419,8 +423,9 @@ mod tests {
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("Use team_send_message to report results to the leader slot_id"));
         assert!(prompt.contains("Leader: Lead (slot_id: lead-1)"));
-        assert!(prompt.contains("Display names are only for user-facing text"));
-        assert!(prompt.contains("Never pass display names as agent targets"));
+        assert!(prompt.contains("Display names are not agent targets"));
+        assert!(prompt.contains("owner_name` field is the"));
+        assert!(prompt.contains("Never pass a display name where a slot_id target is required"));
         assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
         assert!(prompt.contains("`content_truncated: true`"));
         assert!(prompt.contains("STOP GENERATING"));
