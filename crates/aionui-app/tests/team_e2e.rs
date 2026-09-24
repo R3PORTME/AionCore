@@ -1591,6 +1591,34 @@ async fn fresh_start_rebinds_workspace_clears_team_work_and_resets_all_provider_
 }
 
 #[tokio::test]
+async fn fresh_start_rejects_unavailable_workspace_before_mutating_team() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let old_workspace = data["workspace"].as_str().unwrap().to_owned();
+    let root = tempfile::TempDir::new().unwrap();
+    let missing_workspace = root.path().join("missing-worktree");
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-start"),
+        json!({ "workspace": missing_workspace.to_string_lossy() }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let snapshot = app
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let body = body_json(snapshot).await;
+    assert_eq!(body["data"]["workspace"], old_workspace);
+}
+
+#[tokio::test]
 async fn fresh_start_rejects_missing_csrf() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
