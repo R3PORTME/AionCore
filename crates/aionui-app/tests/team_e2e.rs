@@ -1757,7 +1757,7 @@ async fn context_reset_requires_csrf() {
 }
 
 #[tokio::test]
-async fn fresh_run_rebinds_workspace_and_clears_team_state() {
+async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
@@ -1796,6 +1796,24 @@ async fn fresh_run_rebinds_workspace_and_clears_team_state() {
     .await
     .unwrap();
 
+    for (message_id, conversation_id, body) in [
+        ("fresh-run-lead-history", lead_conversation_id, "old lead issue"),
+        ("fresh-run-worker-history", worker_conversation_id, "old worker issue"),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, conversation_id, msg_id, type, content, position, status, hidden, created_at, backend_turn_id) \
+             VALUES (?, ?, ?, 'text', ?, 'left', 'finish', 0, 100, NULL)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(json!({ "content": body }).to_string())
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    }
+
     let workspace = std::env::temp_dir().join(format!("aionui-team-fresh-run-{team_id}"));
     std::fs::create_dir_all(&workspace).unwrap();
     let workspace_string = workspace.to_string_lossy().to_string();
@@ -1821,10 +1839,41 @@ async fn fresh_run_rebinds_workspace_and_clears_team_state() {
     let team = body_json(team).await;
     assert_eq!(team["data"]["workspace"], workspace_string);
 
-    for conversation_id in [lead_conversation_id, worker_conversation_id] {
-        let extra = conversation_extra(&services, conversation_id).await;
+    let fresh_lead_conversation_id = team["data"]["assistants"][0]["conversation_id"].as_str().unwrap();
+    let fresh_worker_conversation_id = team["data"]["assistants"][1]["conversation_id"].as_str().unwrap();
+    assert_ne!(fresh_lead_conversation_id, lead_conversation_id);
+    assert_ne!(fresh_worker_conversation_id, worker_conversation_id);
+
+    for (fresh_conversation_id, previous_conversation_id) in [
+        (fresh_lead_conversation_id, lead_conversation_id),
+        (fresh_worker_conversation_id, worker_conversation_id),
+    ] {
+        let extra = conversation_extra(&services, fresh_conversation_id).await;
         assert_eq!(extra["workspace"], workspace_string);
+        assert_eq!(
+            extra["team_issue_previous_conversation_id"],
+            previous_conversation_id
+        );
     }
+
+    let old_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)",
+    )
+    .bind(lead_conversation_id)
+    .bind(worker_conversation_id)
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+    let fresh_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)",
+    )
+    .bind(fresh_lead_conversation_id)
+    .bind(fresh_worker_conversation_id)
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(old_history_count, 2, "previous Issue history must be preserved");
+    assert_eq!(fresh_history_count, 0, "new Issue conversations must start blank");
 
     let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
         .bind(team_id)

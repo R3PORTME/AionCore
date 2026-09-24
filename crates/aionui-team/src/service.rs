@@ -2484,13 +2484,26 @@ impl TeamSessionService {
             {
                 cleared_context_anchors += 1;
             }
-            self.conversation_port
-                .patch_runtime_config(
-                    &agent.conversation_id,
-                    serde_json::json!({ "workspace": workspace.clone() }),
-                )
-                .await?;
         }
+
+        // Rotate only the member conversation generation. Slot identity, role,
+        // assistant binding, model profile, and the previous conversation rows
+        // remain intact; the rebuilt Team points at blank conversations whose
+        // runtime state is seeded from the previous generation.
+        let mut fresh_agents = Vec::with_capacity(team.agents.len());
+        for agent in &team.agents {
+            let conversation_id = self
+                .conversation_port
+                .create_fresh_conversation_generation(user_id, &agent.conversation_id, &workspace)
+                .await?;
+            let mut fresh_agent = agent.clone();
+            fresh_agent.conversation_id = conversation_id;
+            fresh_agent.status = None;
+            fresh_agent.conversation_type = None;
+            fresh_agent.cli_path = None;
+            fresh_agents.push(fresh_agent);
+        }
+        let agents_json = serde_json::to_string(&fresh_agents)?;
 
         self.repo
             .update_team(
@@ -2498,6 +2511,7 @@ impl TeamSessionService {
                 team_id,
                 &UpdateTeamParams {
                     workspace: Some(workspace.clone()),
+                    agents: Some(agents_json),
                     ..Default::default()
                 },
             )
@@ -2507,7 +2521,7 @@ impl TeamSessionService {
 
         info!(
             team_id,
-            member_count = team.agents.len(),
+            member_count = fresh_agents.len(),
             cleared_context_anchors,
             workspace = %workspace,
             "team fresh run prepared"
@@ -2521,7 +2535,7 @@ impl TeamSessionService {
 
         Ok(TeamFreshRunResponse {
             workspace,
-            member_count: team.agents.len(),
+            member_count: fresh_agents.len(),
             cleared_context_anchors,
         })
     }

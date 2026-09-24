@@ -666,6 +666,18 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn create_fresh_conversation_generation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        workspace: &str,
+    ) -> Result<String, TeamError> {
+        self.conversation_service
+            .create_fresh_team_generation(user_id, conversation_id, workspace)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn warmup_agent_process(
         &self,
         user_id: &str,
