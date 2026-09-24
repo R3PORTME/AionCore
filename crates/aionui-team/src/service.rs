@@ -928,6 +928,7 @@ impl TeamSessionService {
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let team = self.load_owned_team(user_id, team_id).await?;
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
@@ -984,6 +985,7 @@ impl TeamSessionService {
     /// archived team stops streaming just like a deleted one; unarchiving
     /// cold-starts a fresh runtime.
     pub async fn stop_team_processes(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let team = self.load_owned_team(user_id, team_id).await?;
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::Archived)
             .await;
@@ -1013,6 +1015,7 @@ impl TeamSessionService {
         team_id: &str,
         req: AddAgentRequest,
     ) -> Result<TeamAgentResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -1069,6 +1072,7 @@ impl TeamSessionService {
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -1447,6 +1451,7 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team_row(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await
     }
@@ -2399,6 +2404,10 @@ impl TeamSessionService {
         context: &crate::tool_executor::TeamToolContext,
         call: TeamToolCall,
     ) -> Result<serde_json::Value, TeamToolErrorPayload> {
+        let _lifecycle_guard = self
+            .acquire_lifecycle_admission(&context.team_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?;
         let scheduler = self
             .get_session_scheduler(&context.team_id)
             .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
@@ -2532,6 +2541,7 @@ impl TeamSessionService {
     }
 
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.stop_session_unchecked(team_id);
         Ok(())
@@ -2662,6 +2672,7 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
@@ -2677,6 +2688,7 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
@@ -2691,6 +2703,7 @@ impl TeamSessionService {
         slot_id: &str,
         request: InterruptTeamAgentRequest,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (message, files) = self
@@ -2764,6 +2777,7 @@ impl TeamSessionService {
     /// the background and any preserved unread mailbox rows are re-drained by
     /// the member's event loop via `reconcile_mailbox`.
     pub async fn attach_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -2798,6 +2812,7 @@ impl TeamSessionService {
     /// terminal outcome so callers only receive success once the runtime is
     /// ready.
     pub async fn restart_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.restart_agent_runtime_inner(user_id, team_id, slot_id, false).await
     }
 
@@ -2807,6 +2822,7 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.restart_agent_runtime_inner(user_id, team_id, slot_id, true).await
     }
 
@@ -2936,6 +2952,7 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
     ) -> Result<TeamContextResetResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.clear_agent_context_inner(user_id, team_id, slot_id).await
     }
 
@@ -3215,6 +3232,7 @@ impl TeamSessionService {
         target_slot_id: Option<String>,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -3235,6 +3253,7 @@ impl TeamSessionService {
         slot_id: &str,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -3255,6 +3274,7 @@ impl TeamSessionService {
         slot_id: &str,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -3268,6 +3288,7 @@ impl TeamSessionService {
     }
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let team = self.load_owned_team(user_id, team_id).await?;
         if let Some(starting_member) = team
             .agents
