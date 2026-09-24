@@ -1857,7 +1857,9 @@ async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
     }
 
     let old_history_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)",
+        "SELECT COUNT(*) FROM messages \
+         WHERE id IN ('fresh-run-lead-history', 'fresh-run-worker-history') \
+           AND conversation_id IN (?, ?)",
     )
     .bind(lead_conversation_id)
     .bind(worker_conversation_id)
