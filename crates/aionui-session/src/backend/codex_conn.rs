@@ -967,6 +967,13 @@ struct Discovered {
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
+    /// Last effort reported by `thread/settings/updated`.
+    ///
+    /// Codex emits this independently of model/mode. Keeping it beside the
+    /// handshake-discovered catalog gives the synchronous `capabilities()`
+    /// snapshot an authoritative live value after session rebuilds, instead of
+    /// relying on the conversation layer's ephemeral optimistic override.
+    current_effort: Option<String>,
 }
 
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
@@ -1724,6 +1731,16 @@ async fn reader_task(
                         // server notification → SessionEvent(s)
                         let cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        if m == "thread/settings/updated" {
+                            let settings = params
+                                .get("threadSettings")
+                                .or_else(|| params.get("thread_settings"))
+                                .unwrap_or(&Value::Null);
+                            if let Some(raw_effort) = settings.get("effort") {
+                                let effort = raw_effort.as_str().map(str::to_owned);
+                                discovered.lock().unwrap_or_else(|e| e.into_inner()).current_effort = effort;
+                            }
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -4578,6 +4595,7 @@ impl SessionBackend for CodexSessionBackend {
         if !disc.modes.is_empty() {
             caps.available_modes = disc.modes.clone();
         }
+        caps.current_effort = disc.current_effort.clone();
         caps
     }
 
@@ -7152,6 +7170,42 @@ mod tests {
                 SessionEvent::ConfigChanged { model: Some(m), mode: Some(md) } if m == "gpt-5.5" && md == "full-access"
             )),
             "thread/settings/updated → ConfigChanged{{model, mode=legacy bare token of activePermissionProfile.id}}, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_settings_updated_projects_effort_into_capabilities() {
+        // Live repro (codex-cli 0.156.1) emits `thread/settings/updated` with
+        // `threadSettings.effort` after a persisted effort is re-applied. The
+        // backend must retain that observed value so a rebuilt Team conversation
+        // reports it through get_config_options instead of null.
+        let bytes = concat!(
+            r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"gpt-6-luna","effort":"xhigh","activePermissionProfile":{"id":":danger-full-access"}}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::new(
+            bytes,
+            Some(crate::event::ExitStatusLite {
+                code: Some(0),
+                signal: None,
+            }),
+        );
+        fake.release_exit();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+
+        for _ in 0..100 {
+            if backend.capabilities().current_effort.as_deref() == Some("xhigh") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            backend.capabilities().current_effort.as_deref(),
+            Some("xhigh"),
+            "thread/settings/updated effort must be reflected in capabilities"
         );
     }
 
