@@ -14,7 +14,7 @@ use aionui_api_types::{
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
     TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
     TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamSlotWorkState, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
@@ -954,6 +954,96 @@ impl TeamSessionService {
             .await?;
         self.broadcast_team_renamed(user_id, team_id, name);
         Ok(())
+    }
+
+    /// Start the persisted Team on a clean task boundary without rebuilding its
+    /// roster. Provider resume anchors, mailbox and task state are discarded;
+    /// visible conversation history is intentionally retained as an audit trail.
+    pub async fn fresh_start_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        workspace: &str,
+    ) -> Result<TeamResponse, TeamError> {
+        let workspace = validate_create_workspace_path(workspace)?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let membership_guard = membership_lock.lock().await;
+
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&row)?;
+        let run_state = self.get_run_state(user_id, team_id).await?;
+        let has_active_work = run_state.active_run.is_some()
+            || run_state.slot_work.iter().any(|slot| {
+                slot.state != TeamSlotWorkState::Idle
+                    || slot.queued_foreground_count > 0
+                    || slot.queued_background_count > 0
+                    || slot.active_turn_id.is_some()
+            });
+        if has_active_work {
+            return Err(TeamError::InvalidRequest(
+                "team must be idle before starting fresh".to_owned(),
+            ));
+        }
+
+        for agent in &team.agents {
+            if !self
+                .conversation_port
+                .supports_context_reset(user_id, &agent.conversation_id)
+                .await?
+            {
+                return Err(TeamError::MemberUnsupported {
+                    team_id: team_id.to_owned(),
+                    slot_id: agent.slot_id.clone(),
+                    conversation_id: agent.conversation_id.clone(),
+                    backend: agent.backend.clone(),
+                });
+            }
+        }
+
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamContextReset)
+            .await;
+
+        for agent in &team.agents {
+            self.conversation_port
+                .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace }))
+                .await?;
+        }
+        for agent in &team.agents {
+            if !self
+                .conversation_port
+                .clear_context_anchor(user_id, &agent.conversation_id)
+                .await?
+            {
+                return Err(TeamError::InvalidRequest(format!(
+                    "failed to clear provider context for team member: {}",
+                    agent.slot_id
+                )));
+            }
+        }
+
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    workspace: Some(workspace.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
+        self.repo.delete_tasks_by_team(user_id, team_id).await?;
+
+        info!(team_id, member_count = team.agents.len(), "team fresh start persisted");
+        drop(membership_guard);
+
+        self.ensure_session(user_id, team_id).await?;
+        let refreshed = Team::from_row(&self.load_owned_team_row(user_id, team_id).await?)?;
+        self.build_team_response(user_id, &refreshed).await
     }
 
     pub async fn add_agent(

@@ -11,7 +11,8 @@ use axum::routing::{get, post, put};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    FreshStartTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest,
+    RenameTeamRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
@@ -180,6 +181,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
+        .route("/api/teams/{id}/fresh-start", post(fresh_start_team))
         .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
@@ -273,6 +275,17 @@ async fn remove_team(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.remove_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn fresh_start_team(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<FreshStartTeamRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let team = state.service.fresh_start_team(&user.id, &id, &req.workspace).await?;
+    Ok(Json(ApiResponse::ok(team)))
 }
 
 /// Query parameters for the read-only team activity endpoints. `limit` is
