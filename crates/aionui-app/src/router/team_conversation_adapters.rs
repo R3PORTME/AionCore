@@ -590,6 +590,18 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn rebind_project_for_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        workspace: &str,
+    ) -> Result<bool, TeamError> {
+        self.conversation_service
+            .rebind_project_for_workspace(user_id, conversation_id, workspace)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
         let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service

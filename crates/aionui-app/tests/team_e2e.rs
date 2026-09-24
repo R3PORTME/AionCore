@@ -1576,6 +1576,26 @@ async fn fresh_start_rebinds_workspace_clears_team_work_and_resets_all_provider_
         assert!(extra["mock_acp_session_id"].is_null());
     }
 
+    let team_binding: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT project_id, folder_id FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_one(services.database.pool())
+            .await
+            .unwrap();
+    assert!(team_binding.0.is_some(), "fresh workspace should resolve a Team project binding");
+    assert!(team_binding.1.is_some(), "fresh workspace should resolve a Team folder binding");
+
+    for agent in agents {
+        let conversation_id = agent["conversation_id"].as_str().unwrap();
+        let conversation_binding: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT project_id, folder_id FROM conversations WHERE id = ?")
+                .bind(conversation_id)
+                .fetch_one(services.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(conversation_binding, team_binding);
+    }
+
     let mailbox_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
         .bind(team_id)
         .fetch_one(services.database.pool())

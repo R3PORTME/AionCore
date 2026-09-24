@@ -1004,6 +1004,8 @@ impl TeamSessionService {
             }
         }
 
+        let (project_id, folder_id) = self.resolve_binding_best_effort(user_id, &workspace).await;
+
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamContextReset)
             .await;
 
@@ -1011,6 +1013,20 @@ impl TeamSessionService {
             self.conversation_port
                 .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace.clone() }))
                 .await?;
+        }
+        for agent in &team.agents {
+            if !self
+                .conversation_port
+                .rebind_project_for_workspace(user_id, &agent.conversation_id, &workspace)
+                .await?
+            {
+                warn!(
+                    team_id,
+                    slot_id = %agent.slot_id,
+                    conversation_id = %agent.conversation_id,
+                    "team fresh start could not refresh conversation project binding"
+                );
+            }
         }
         for agent in &team.agents {
             if !self
@@ -1031,6 +1047,8 @@ impl TeamSessionService {
                 team_id,
                 &UpdateTeamParams {
                     workspace: Some(workspace.clone()),
+                    project_id,
+                    folder_id,
                     ..Default::default()
                 },
             )

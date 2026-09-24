@@ -480,6 +480,23 @@ impl ConversationService {
     /// backfilled + the row update succeeded), so a lazy-read caller can emit a
     /// `conversation.listChanged` and let the client refetch the now-bound id.
     /// All failure modes return `false` and are swallowed (best-effort contract).
+    pub async fn rebind_project_for_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        workspace_path: &str,
+    ) -> Result<bool, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        Ok(self
+            .bind_project_best_effort(user_id, conversation_id, workspace_path)
+            .await)
+    }
+
     async fn bind_project_best_effort(&self, user_id: &str, conversation_id: &str, workspace_path: &str) -> bool {
         let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         let Some(project_service) = project_service else {
