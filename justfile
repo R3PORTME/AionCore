@@ -6,7 +6,6 @@ build_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile
 install_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/install.ps1" } else { "bash scripts/just/install.sh" }
 migration_check_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.ps1" } else { "bash scripts/migration/check-immutability.sh" }
 migration_check_test_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.test.ps1" } else { "bash scripts/migration/check-immutability.test.sh" }
-auto_commit_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/auto-commit-fixes.ps1" } else { "bash scripts/just/auto-commit-fixes.sh" }
 update_aionrs_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/update-aionrs.ps1" } else { "bash scripts/just/update-aionrs.sh" }
 cat_config_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/cat-config.ps1" } else { "bash scripts/just/cat-config.sh" }
 
@@ -75,13 +74,12 @@ run *ARGS:
 run-release *ARGS:
     @just _cargo run --release --bin aioncore -- {{ARGS}}
 
-# Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
-push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
+# Pre-push gate: validate the candidate without changing tracked files
+push *ARGS: migration-check
+    @just _cargo clippy --locked --workspace -- -D warnings
+    @just fmt-check
+    @just _cargo nextest run --locked --workspace
     git push {{ARGS}}
-
-# Auto-commit any formatting/lint fixes if there are changes
-_auto-commit-fixes:
-    @{{auto_commit_script}}
 
 # Update aionrs dependency: bump Cargo.toml tag, then open a PR whose body
 # carries aionrs feat/fix/perf as conventional footer for release-please.
