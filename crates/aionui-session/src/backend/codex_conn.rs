@@ -86,6 +86,56 @@ fn log_codex_runtime_policy(spawn_env: &[aionui_common::EnvVar]) {
     );
 }
 
+#[derive(Debug, Default)]
+struct ResumeHandshakeState {
+    pending_rpc_id: Option<u64>,
+    poison: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeResponseClaim {
+    Stale,
+    Accepted,
+    Rejected,
+}
+
+/// Publish a correlated resume response as one state transition. Keeping the
+/// pending id and poison together means waiters cannot observe "resume complete"
+/// before a rejection is visible, and a late response cannot mutate a newer
+/// attempt's binding or error state.
+async fn publish_resume_response(
+    state: &Mutex<ResumeHandshakeState>,
+    thread_binding: &Mutex<Option<String>>,
+    rpc_id: u64,
+    error_message: Option<&str>,
+) -> ResumeResponseClaim {
+    let mut state = state.lock().await;
+    if state.pending_rpc_id != Some(rpc_id) {
+        return ResumeResponseClaim::Stale;
+    }
+
+    if let Some(message) = error_message {
+        state.poison = Some(format!("codex thread/resume failed: {message}"));
+        *thread_binding.lock().await = None;
+        state.pending_rpc_id = None;
+        ResumeResponseClaim::Rejected
+    } else {
+        state.pending_rpc_id = None;
+        ResumeResponseClaim::Accepted
+    }
+}
+
+fn codex_current_mode_seed(config_mode: Option<&str>, opened_fresh: bool) -> Option<String> {
+    let requested = config_mode.map(codex_perm::mode_to_catalog_value);
+    if opened_fresh {
+        Some(requested.unwrap_or_else(|| {
+            codex_perm::profile_id_to_legacy_value(":workspace")
+        }))
+    } else {
+        requested
+    }
+}
+
 /// Connection-level factory for codex. Holds the injected `Spawner`. Unlike
 /// claude (1:1), codex's app-server CAN multiplex threads on one process — but
 /// P1 opens one process per logical session (multiplexing is a later refinement;
@@ -200,21 +250,21 @@ impl BackendConnection for CodexConnection {
         // so the picker shows a highlighted default instead of a blank. This is a faithful
         // replication of the thread's real launch tier, not a masking default.
         //
-        // The fresh-default is gated to `SessionSpec::Fresh`: on Resume codex restores the
-        // thread's own tier and surfaces it via `thread/settings/updated`, so falsely
-        // seeding `auto` for a resumed thread that was actually on another tier would
-        // mis-highlight until the notification lands (and Resume's fresh currentModeId is
-        // not live-verified). Resume therefore keeps only the normalized persisted value.
-        let normalized_config_mode = config.mode.as_deref().map(codex_perm::mode_to_catalog_value);
-        backend.capabilities.current_mode = match &spec {
-            SessionSpec::Fresh { .. } => {
-                normalized_config_mode.or_else(|| Some(codex_perm::profile_id_to_legacy_value(":workspace")))
-            }
-            // Fork inherits the forked thread's own tier exactly like Resume
-            // (codex restores it and surfaces `thread/settings/updated`), so no
-            // fresh-default seed either.
-            SessionSpec::Resume { .. } | SessionSpec::Fork { .. } => normalized_config_mode,
-        };
+        // The fresh-default is gated to sessions that actually start with `thread/start`:
+        // an anchored Resume restores its own tier and surfaces it via
+        // `thread/settings/updated`, so falsely seeding `auto` there would mis-highlight
+        // until the notification lands. A Resume without an anchor and a rejected Resume
+        // both start Fresh, so they use the same default as a normal Fresh open.
+        let starts_fresh = matches!(
+            &spec,
+            SessionSpec::Fresh { .. }
+                | SessionSpec::Resume {
+                    backend_session_id: None,
+                    ..
+                }
+        );
+        backend.capabilities.current_mode =
+            codex_current_mode_seed(config.mode.as_deref(), starts_fresh);
 
         // JSON-RPC handshake over the retained stdin (the reader task is already
         // draining stdout). REAL codex 0.137.0 wire (verified against the
@@ -277,6 +327,8 @@ impl BackendConnection for CodexConnection {
                     );
                     backend.recover_dead_resume_as_fresh().await?;
                     opened_fresh = true;
+                    backend.capabilities.current_mode =
+                        codex_current_mode_seed(config.mode.as_deref(), true);
                 }
                 Err(err) => return Err(err),
             }
@@ -859,22 +911,12 @@ pub struct CodexSessionBackend {
     /// or pre-seeded on Resume). All `turn/*` + `thread/*` client requests need
     /// it. Two-id (§4.1): the backend threadId never escapes upward.
     thread_binding: Arc<Mutex<Option<String>>>,
-    /// The rpc id of the in-flight `thread/resume` (Resume handshakes only). The
-    /// reader claims the response: an ERROR means the pre-seeded binding points at
-    /// a thread this codex cannot restore ("no rollout found for thread id …",
-    /// verified: samples/codex-cli/0.144.1/dead_resume.jsonl) — the binding is
-    /// cleared and `resume_poison` set. A success just drops the correlation
-    /// (the follow-up `thread/started` re-confirms the binding).
-    pending_resume: Arc<Mutex<Option<u64>>>,
-    /// Set when codex REJECTED the `thread/resume` (dead resume anchor). Carries
-    /// the codex error message; `bound_thread_within` fails FAST with it
-    /// (`BackendError::SessionNotFound`) instead of polling a binding that will
-    /// never arrive — the send-path then classifies it as a dead-session error
-    /// and the conversation's recovery (anchor clear + auto-replay) takes over.
-    /// Reset at the start of every handshake (a re-spawn is a fresh chance).
-    resume_poison: Arc<Mutex<Option<String>>>,
+    /// Correlates a `thread/resume` response with its attempt and publishes
+    /// rejection state atomically for both the reader and waiters. The same
+    /// poison also carries a rejected `thread/fork` handshake.
+    resume_handshake: Arc<Mutex<ResumeHandshakeState>>,
     /// The rpc id of the in-flight `thread/fork` (Fork handshakes only,
-    /// `pending_resume`'s sibling). The reader claims the response: an ERROR
+    /// the resume correlation's sibling). The reader claims the response: an ERROR
     /// (parent rollout gone, parent turn in flight, …) poisons the bound-thread
     /// wait — a Fork handshake pre-seeds NO binding, so without the poison the
     /// first Send would poll forever for a `thread/started` that never comes.
@@ -1050,8 +1092,7 @@ struct CodexReaderState {
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
-    pending_resume: Arc<Mutex<Option<u64>>>,
-    resume_poison: Arc<Mutex<Option<String>>>,
+    resume_handshake: Arc<Mutex<ResumeHandshakeState>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
@@ -1088,8 +1129,7 @@ fn start_codex_reader(
             state.pending_discovery,
             state.pending_set,
             state.pending_steers,
-            state.pending_resume,
-            state.resume_poison,
+            state.resume_handshake,
             state.pending_fork,
             state.discovered,
             state.stdin,
@@ -1252,7 +1292,7 @@ impl CodexSessionBackend {
     /// `run_handshake` registers it.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn register_pending_resume_for_test(&self, rpc_id: u64) {
-        *self.pending_resume.lock().await = Some(rpc_id);
+        self.resume_handshake.lock().await.pending_rpc_id = Some(rpc_id);
     }
 
     /// Test-support seam: shrink the steer-ack await so a fixture without a
@@ -1299,8 +1339,7 @@ impl CodexSessionBackend {
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_steers = Arc::new(Mutex::new(HashMap::new()));
-        let pending_resume = Arc::new(Mutex::new(None));
-        let resume_poison = Arc::new(Mutex::new(None));
+        let resume_handshake = Arc::new(Mutex::new(ResumeHandshakeState::default()));
         let pending_fork = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1324,8 +1363,7 @@ impl CodexSessionBackend {
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
             pending_steers: pending_steers.clone(),
-            pending_resume: pending_resume.clone(),
-            resume_poison: resume_poison.clone(),
+            resume_handshake: resume_handshake.clone(),
             pending_fork: pending_fork.clone(),
             discovered: discovered.clone(),
             stdin: stdin.clone(),
@@ -1383,8 +1421,7 @@ impl CodexSessionBackend {
             pending_discovery,
             pending_set,
             pending_steers,
-            pending_resume,
-            resume_poison,
+            resume_handshake,
             pending_fork,
             discovered,
             steer_ack_timeout_ms: AtomicU64::new(STEER_ACK_TIMEOUT_MS),
@@ -1437,12 +1474,13 @@ impl CodexSessionBackend {
     async fn bound_thread_within(&self, budget: std::time::Duration) -> Result<String, BackendError> {
         let polls = (budget.as_millis() / 50).max(1) as u64;
         for _ in 0..polls {
+            let resume = self.resume_handshake.lock().await;
             // Dead resume anchor (ELECTRON-3Q0): codex rejected the thread/resume,
             // so the binding this poll waits for will NEVER arrive. Fail fast with
             // the codex message as a SessionNotFound — the send-path maps it to the
             // dead-session error class, which clears the persisted anchor and lets
             // the conversation's auto-replay reopen Fresh.
-            if let Some(poison) = self.resume_poison.lock().await.clone() {
+            if let Some(poison) = resume.poison.clone() {
                 return Err(BackendError::SessionNotFound(poison));
             }
             // A Resume pre-seeds thread_binding before codex has accepted
@@ -1450,10 +1488,11 @@ impl CodexSessionBackend {
             // the resume RPC is still pending: a config write in this window used
             // to race the eventual "no rollout found" response and target a dead
             // thread id (the Team fresh-run/app-restart repro).
-            let resume_pending = self.pending_resume.lock().await.is_some();
+            let resume_pending = resume.pending_rpc_id.is_some();
             if !resume_pending && let Some(tid) = self.thread_binding.lock().await.clone() {
                 return Ok(tid);
             }
+            drop(resume);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Err(BackendError::HandshakeTimeout(format!(
@@ -1468,12 +1507,14 @@ impl CodexSessionBackend {
         let budget = super::handshake_budget();
         let polls = (budget.as_millis() / 50).max(1) as u64;
         for _ in 0..polls {
-            if let Some(poison) = self.resume_poison.lock().await.clone() {
+            let resume = self.resume_handshake.lock().await;
+            if let Some(poison) = resume.poison.clone() {
                 return Err(BackendError::SessionNotFound(poison));
             }
-            if self.pending_resume.lock().await.is_none() {
+            if resume.pending_rpc_id.is_none() {
                 return Ok(());
             }
+            drop(resume);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Err(BackendError::HandshakeTimeout(format!(
@@ -1488,9 +1529,11 @@ impl CodexSessionBackend {
     /// returning. Discovery/skills/init from the first handshake remain valid; only
     /// the dead thread anchor is replaced.
     async fn recover_dead_resume_as_fresh(&self) -> Result<(), BackendError> {
-        *self.resume_poison.lock().await = None;
-        *self.pending_resume.lock().await = None;
+        let mut resume = self.resume_handshake.lock().await;
+        resume.poison = None;
+        resume.pending_rpc_id = None;
         *self.thread_binding.lock().await = None;
+        drop(resume);
 
         let id = self.next_rpc_id();
         self.write_frame(thread_start_params(&self.wake.config).into_frame(id, "thread/start"))
@@ -1508,7 +1551,11 @@ impl CodexSessionBackend {
     async fn run_handshake(&self, mode: HandshakeMode<'_>) -> Result<(), BackendError> {
         // A handshake is a fresh chance: any prior resume rejection belonged to
         // the previous process/attempt.
-        *self.resume_poison.lock().await = None;
+        {
+            let mut resume = self.resume_handshake.lock().await;
+            resume.poison = None;
+            resume.pending_rpc_id = None;
+        }
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
 
@@ -1532,7 +1579,6 @@ impl CodexSessionBackend {
 
         match mode {
             HandshakeMode::Resume(tid) => {
-                *self.thread_binding.lock().await = Some(tid.to_string());
                 // Resume re-sends the full thread/start override surface — a bare
                 // {threadId} resume silently drops the user's MCP servers and
                 // resets approvalPolicy to its default (LIVE 0.144.1, see
@@ -1544,7 +1590,11 @@ impl CodexSessionBackend {
                 // in place made every turn/start hit the dead threadId and hang
                 // (ELECTRON-3Q0).
                 let resume_id = self.next_rpc_id();
-                *self.pending_resume.lock().await = Some(resume_id);
+                {
+                    let mut resume = self.resume_handshake.lock().await;
+                    *self.thread_binding.lock().await = Some(tid.to_string());
+                    resume.pending_rpc_id = Some(resume_id);
+                }
                 self.write_frame(thread_resume_params(&self.wake.config, tid).into_frame(resume_id, "thread/resume"))
                     .await?;
             }
@@ -1681,8 +1731,7 @@ async fn reader_task(
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
-    pending_resume: Arc<Mutex<Option<u64>>>,
-    resume_poison: Arc<Mutex<Option<String>>>,
+    resume_handshake: Arc<Mutex<ResumeHandshakeState>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
@@ -2002,27 +2051,23 @@ async fn reader_task(
                             // restore: clear it and poison the bound-thread wait so a
                             // Send fails fast with the real cause instead of writing
                             // turn/start at a dead threadId (or timing out opaquely).
-                            let is_resume = {
-                                let mut pending = pending_resume.lock().await;
-                                match *pending {
-                                    Some(prid) if prid == rid => {
-                                        *pending = None;
-                                        true
-                                    }
-                                    _ => false,
-                                }
-                            };
-                            if is_resume && let Some(msg) = error_message.as_deref() {
+                            let resume_claim = publish_resume_response(
+                                &resume_handshake,
+                                &thread_binding,
+                                rid,
+                                error_message.as_deref(),
+                            )
+                            .await;
+                            if resume_claim == ResumeResponseClaim::Rejected {
+                                let msg = error_message.as_deref().unwrap_or("request rejected");
                                 tracing::warn!(
                                     conversation_id = %session_id,
                                     error = %msg,
                                     "codex thread/resume rejected — clearing poisoned thread binding (dead resume anchor)"
                                 );
-                                *thread_binding.lock().await = None;
-                                *resume_poison.lock().await = Some(format!("codex thread/resume failed: {msg}"));
                                 continue;
                             }
-                            // Claim the thread/fork response (pending_resume's
+                            // Claim the thread/fork response (the resume correlation's
                             // sibling). A Fork handshake pre-seeds NO binding, so
                             // an ERROR (parent rollout gone, …) must poison the
                             // bound-thread wait or the first Send polls forever.
@@ -2047,7 +2092,8 @@ async fn reader_task(
                                     error = %msg,
                                     "codex thread/fork rejected — poisoning bound-thread wait (no silent fallback)"
                                 );
-                                *resume_poison.lock().await = Some(format!("codex thread/fork failed: {msg}"));
+                                resume_handshake.lock().await.poison =
+                                    Some(format!("codex thread/fork failed: {msg}"));
                                 continue;
                             }
                             let pending_send = pending_sends.lock().await.remove(&rid);
@@ -4091,7 +4137,7 @@ impl SessionBackend for CodexSessionBackend {
                 // REAL codex 0.137.0 turn-driver: `turn/start{threadId, input}`
                 // (verified against the aion-probe transcripts). Needs the bound
                 // threadId (waits briefly for the async thread/started; fails FAST
-                // when the resume was rejected — see `resume_poison`).
+                // when the resume was rejected — see `resume_handshake.poison`).
                 let tid = match self.bound_thread().await {
                     Ok(tid) => tid,
                     Err(e) => {
@@ -4875,6 +4921,123 @@ mod tests {
     #[test]
     fn capabilities_advertise_midturn_delivery() {
         assert!(codex_capabilities().supports_midturn_delivery);
+    }
+
+    #[test]
+    fn fresh_fallback_mode_uses_auto_without_overwriting_requested_mode() {
+        assert_eq!(codex_current_mode_seed(None, true).as_deref(), Some("auto"));
+        assert_eq!(codex_current_mode_seed(None, false), None);
+        assert_eq!(
+            codex_current_mode_seed(Some("read-only"), true).as_deref(),
+            Some("read-only"),
+            "a persisted mode remains authoritative when Resume falls back to Fresh"
+        );
+        assert_eq!(
+            codex_current_mode_seed(Some("agent-full-access"), true).as_deref(),
+            Some("full-access"),
+            "canonical persisted full-access is projected into the catalog vocabulary"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_rejected_resume_publishes_poison_with_completion() {
+        let backend = Arc::new(
+            CodexSessionBackend::build_with_io(
+                "codex-resume-publication",
+                Box::new(FakeAgentIo::never_exits(Vec::new())),
+            )
+            .await,
+        );
+        backend.seed_thread_binding_for_test("th-dead").await;
+        backend.register_pending_resume_for_test(7).await;
+
+        // Hold the binding lock so the publisher pauses after beginning its
+        // rejection transition. A confirmation waiter must block on the same
+        // state until the rejection is fully published, never see pending=None
+        // with no poison and incorrectly report success.
+        let binding_guard = backend.thread_binding.lock().await;
+        let state_for_publisher = backend.resume_handshake.clone();
+        let binding_for_publisher = backend.thread_binding.clone();
+        let publisher = tokio::spawn(async move {
+            publish_resume_response(
+                &state_for_publisher,
+                &binding_for_publisher,
+                7,
+                Some("no rollout found"),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if backend.resume_handshake.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resume publication must reach its guarded transition");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter_backend = backend.clone();
+        let waiter = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiter_backend.await_resume_confirmation().await
+        });
+        started_rx.await.expect("confirmation waiter started");
+        assert!(!waiter.is_finished(), "a waiter cannot see partial publication");
+
+        drop(binding_guard);
+        assert_eq!(
+            publisher.await.expect("resume publisher task"),
+            ResumeResponseClaim::Rejected
+        );
+        let state = backend.resume_handshake.lock().await;
+        assert_eq!(state.pending_rpc_id, None);
+        assert_eq!(
+            state.poison.as_deref(),
+            Some("codex thread/resume failed: no rollout found")
+        );
+        assert_eq!(backend.thread_binding.lock().await.as_deref(), None);
+        drop(state);
+        assert!(matches!(
+            waiter.await.expect("confirmation waiter task"),
+            Err(BackendError::SessionNotFound(message)) if message == "codex thread/resume failed: no rollout found"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_rejected_resume_cannot_clear_or_poison_a_newer_attempt() {
+        let backend = CodexSessionBackend::build_with_io(
+            "codex-resume-stale-response",
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+        )
+        .await;
+        backend.seed_thread_binding_for_test("th-new").await;
+        backend.register_pending_resume_for_test(8).await;
+
+        assert_eq!(
+            publish_resume_response(
+                &backend.resume_handshake,
+                &backend.thread_binding,
+                7,
+                Some("old rejection")
+            )
+            .await,
+            ResumeResponseClaim::Stale
+        );
+        let state = backend.resume_handshake.lock().await;
+        assert_eq!(state.pending_rpc_id, Some(8));
+        assert_eq!(state.poison, None);
+        assert_eq!(
+            backend.thread_binding.lock().await.as_deref(),
+            Some("th-new")
+        );
+        drop(state);
+        assert!(matches!(
+            backend.bound_thread_within(std::time::Duration::from_millis(1)).await,
+            Err(BackendError::HandshakeTimeout(_))
+        ));
     }
 
     /// A retrying error must reach the user, not just tick the heartbeat.
@@ -9146,10 +9309,10 @@ mod tests {
         backend.register_pending_resume_for_test(7).await;
 
         let binding = backend.thread_binding.clone();
-        let pending = backend.pending_resume.clone();
+        let resume_handshake = backend.resume_handshake.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-            *pending.lock().await = None;
+            resume_handshake.lock().await.pending_rpc_id = None;
             // Keep the same pre-seeded id: success means it is now authoritative.
             assert_eq!(binding.lock().await.as_deref(), Some("th-optimistic"));
         });
@@ -9174,7 +9337,8 @@ mod tests {
         let fake = FakeAgentIo::never_exits(Vec::new());
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-resume-fallback", Box::new(fake)).await;
-        *backend.resume_poison.lock().await = Some("codex thread/resume failed: no rollout found".into());
+        backend.resume_handshake.lock().await.poison =
+            Some("codex thread/resume failed: no rollout found".into());
         backend.seed_thread_binding_for_test("th-dead").await;
 
         let binding = backend.thread_binding.clone();
@@ -9194,7 +9358,7 @@ mod tests {
             "recovery must leave the fresh authoritative binding"
         );
         assert!(
-            backend.resume_poison.lock().await.is_none(),
+            backend.resume_handshake.lock().await.poison.is_none(),
             "fresh recovery clears the dead-resume poison"
         );
         let written = captured_str(&captured).await;
@@ -9268,7 +9432,7 @@ mod tests {
             "a successful resume keeps the pre-seeded binding"
         );
         assert!(
-            backend.resume_poison.lock().await.is_none(),
+            backend.resume_handshake.lock().await.poison.is_none(),
             "a successful resume must not poison the bound-thread wait"
         );
     }
