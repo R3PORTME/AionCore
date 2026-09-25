@@ -115,25 +115,46 @@ mod tests {
 
     #[test]
     fn test_env_override_cache_dir() {
-        // This test verifies the resolve logic reads env vars.
-        // We cannot reliably set env in parallel tests, so just verify
-        // the default path contains "aionui".
         let dir = resolve_cache_dir();
-        assert!(dir.contains("aionui"), "cache_dir should contain 'aionui': {dir}");
+        if let Ok(override_dir) = std::env::var("AIONUI_CACHE_DIR")
+            && !override_dir.is_empty()
+        {
+            assert_eq!(dir, override_dir, "cache_dir should honor AIONUI_CACHE_DIR");
+        } else {
+            assert!(
+                std::path::Path::new(&dir).ends_with("aionui"),
+                "default cache_dir should end in 'aionui': {dir}"
+            );
+        }
     }
 
     #[test]
     fn test_env_override_work_dir() {
         let dir = resolve_work_dir();
-        assert!(dir.contains("aionui"), "work_dir should contain 'aionui': {dir}");
+        if let Ok(override_dir) = std::env::var("AIONUI_WORK_DIR")
+            && !override_dir.is_empty()
+        {
+            assert_eq!(dir, override_dir, "work_dir should honor AIONUI_WORK_DIR");
+        } else {
+            assert!(
+                std::path::Path::new(&dir).ends_with("aionui"),
+                "default work_dir should end in 'aionui': {dir}"
+            );
+        }
     }
 
     #[test]
     fn test_env_override_log_dir() {
         let dir = resolve_log_dir();
-        assert!(
-            dir.to_ascii_lowercase().contains("aionui"),
-            "log_dir should contain 'aionui' (case-insensitive): {dir}"
-        );
+        if let Ok(override_dir) = std::env::var("AIONUI_LOG_DIR")
+            && !override_dir.is_empty()
+        {
+            assert_eq!(dir, override_dir, "log_dir should honor AIONUI_LOG_DIR");
+        } else {
+            assert!(
+                std::path::Path::new(&dir).ends_with(std::path::Path::new("aionui").join("logs")),
+                "default log_dir should end in 'aionui/logs': {dir}"
+            );
+        }
     }
 }
