@@ -5,6 +5,13 @@ cargo_config=()
 restore_cargo_lock=false
 cargo_lock_snapshot=""
 aionrs_root=""
+locked=false
+for arg in "$@"; do
+    if [[ "$arg" == "--locked" ]]; then
+        locked=true
+        break
+    fi
+done
 
 restore_local_lockfile() {
     local status=$?
@@ -25,7 +32,11 @@ trap restore_local_lockfile EXIT
 verify_local_aionrs_patch() {
     local metadata_file
     metadata_file=$(mktemp)
-    cargo "${cargo_config[@]}" metadata --format-version 1 > "$metadata_file"
+    metadata_args=(metadata --format-version 1)
+    if [[ "$locked" == "true" ]]; then
+        metadata_args+=(--locked)
+    fi
+    cargo "${cargo_config[@]}" "${metadata_args[@]}" > "$metadata_file"
 
     python3 - "$aionrs_root" "$metadata_file" "${crates[@]}" <<'PY'
 import json
@@ -93,30 +104,32 @@ if [[ -n "${AIONRS:-}" ]]; then
 
     echo "Using local aionrs SDK: $aionrs_root" >&2
 
-    if [[ -f Cargo.lock ]]; then
-        cargo_lock_snapshot=$(mktemp)
-        cp Cargo.lock "$cargo_lock_snapshot"
+    if [[ "$locked" == "false" ]]; then
+        if [[ -f Cargo.lock ]]; then
+            cargo_lock_snapshot=$(mktemp)
+            cp Cargo.lock "$cargo_lock_snapshot"
 
-        if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
-            restore_cargo_lock=true
-        else
-            echo "Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place." >&2
+            if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
+                restore_cargo_lock=true
+            else
+                echo "Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place." >&2
+            fi
         fi
-    fi
 
-    echo "Resolving Cargo.lock against local aionrs SDK" >&2
-    cargo "${cargo_config[@]}" update \
-        -p aion-agent \
-        -p aion-compact \
-        -p aion-config \
-        -p aion-mcp \
-        -p aion-memory \
-        -p aion-process \
-        -p aion-protocol \
-        -p aion-providers \
-        -p aion-skills \
-        -p aion-tools \
-        -p aion-types
+        echo "Resolving Cargo.lock against local aionrs SDK" >&2
+        cargo "${cargo_config[@]}" update \
+            -p aion-agent \
+            -p aion-compact \
+            -p aion-config \
+            -p aion-mcp \
+            -p aion-memory \
+            -p aion-process \
+            -p aion-protocol \
+            -p aion-providers \
+            -p aion-skills \
+            -p aion-tools \
+            -p aion-types
+    fi
     verify_local_aionrs_patch
 fi
 
