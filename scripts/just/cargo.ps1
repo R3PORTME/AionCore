@@ -1,7 +1,6 @@
 $ErrorActionPreference = "Stop"
 
 $CargoArgs = @($args)
-$locked = $CargoArgs -contains "--locked"
 $cargoConfig = @()
 $restoreCargoLock = $false
 $cargoLockSnapshot = $null
@@ -36,11 +35,7 @@ function Resolve-LocalPath {
 }
 
 function Test-AionrsPatch {
-    $metadataArgs = @("metadata", "--format-version", "1")
-    if ($locked) {
-        $metadataArgs += "--locked"
-    }
-    $metadataJson = & cargo @cargoConfig @metadataArgs
+    $metadataJson = & cargo @cargoConfig metadata --format-version 1
     if ($LASTEXITCODE -ne 0) {
         $script:status = $LASTEXITCODE
         exit $LASTEXITCODE
@@ -67,6 +62,11 @@ function Test-AionrsPatch {
 $status = 0
 try {
     if (-not [string]::IsNullOrWhiteSpace($env:AIONRS)) {
+        if ($CargoArgs -contains "--locked") {
+            [Console]::Error.WriteLine("AIONRS cannot be used with --locked publication checks because resolving a local SDK patch may change Cargo.lock. Unset AIONRS and rerun just push; use just lint/test for local SDK development.")
+            exit 1
+        }
+
         if (-not (Test-Path -LiteralPath $env:AIONRS -PathType Container)) {
             Write-Error "AIONRS does not exist or is not a directory: $env:AIONRS"
             exit 1
@@ -101,37 +101,35 @@ try {
 
         [Console]::Error.WriteLine("Using local aionrs SDK: $aionrsRoot")
 
-        if (-not $locked) {
-            if (Test-Path -LiteralPath "Cargo.lock" -PathType Leaf) {
-                $cargoLockSnapshot = [System.IO.Path]::GetTempFileName()
-                Copy-Item -LiteralPath "Cargo.lock" -Destination $cargoLockSnapshot -Force
+        if (Test-Path -LiteralPath "Cargo.lock" -PathType Leaf) {
+            $cargoLockSnapshot = [System.IO.Path]::GetTempFileName()
+            Copy-Item -LiteralPath "Cargo.lock" -Destination $cargoLockSnapshot -Force
 
-                $worktreeClean = Test-GitDiffClean @("diff", "--quiet", "--", "Cargo.lock")
-                $indexClean = Test-GitDiffClean @("diff", "--cached", "--quiet", "--", "Cargo.lock")
-                if ($worktreeClean -and $indexClean) {
-                    $restoreCargoLock = $true
-                } else {
-                    [Console]::Error.WriteLine("Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place.")
-                }
+            $worktreeClean = Test-GitDiffClean @("diff", "--quiet", "--", "Cargo.lock")
+            $indexClean = Test-GitDiffClean @("diff", "--cached", "--quiet", "--", "Cargo.lock")
+            if ($worktreeClean -and $indexClean) {
+                $restoreCargoLock = $true
+            } else {
+                [Console]::Error.WriteLine("Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place.")
             }
-
-            [Console]::Error.WriteLine("Resolving Cargo.lock against local aionrs SDK")
-            $updateArgs = @($cargoConfig) + @(
-                "update",
-                "-p", "aion-agent",
-                "-p", "aion-compact",
-                "-p", "aion-config",
-                "-p", "aion-mcp",
-                "-p", "aion-memory",
-                "-p", "aion-process",
-                "-p", "aion-protocol",
-                "-p", "aion-providers",
-                "-p", "aion-skills",
-                "-p", "aion-tools",
-                "-p", "aion-types"
-            )
-            Invoke-Native "cargo" $updateArgs
         }
+
+        [Console]::Error.WriteLine("Resolving Cargo.lock against local aionrs SDK")
+        $updateArgs = @($cargoConfig) + @(
+            "update",
+            "-p", "aion-agent",
+            "-p", "aion-compact",
+            "-p", "aion-config",
+            "-p", "aion-mcp",
+            "-p", "aion-memory",
+            "-p", "aion-process",
+            "-p", "aion-protocol",
+            "-p", "aion-providers",
+            "-p", "aion-skills",
+            "-p", "aion-tools",
+            "-p", "aion-types"
+        )
+        Invoke-Native "cargo" $updateArgs
         Test-AionrsPatch
     }
 

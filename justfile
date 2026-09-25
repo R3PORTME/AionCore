@@ -37,7 +37,7 @@ install: build
 
 # Run all tests
 test:
-    @just _cargo nextest run --locked --workspace
+    @just _cargo nextest run --workspace
 
 # Ensure already-shipped database migrations stay immutable
 migration-check:
@@ -49,7 +49,7 @@ migration-check-test:
 
 # Lint (warnings = errors)
 lint:
-    @just _cargo clippy --locked --workspace -- -D warnings
+    @just _cargo clippy --workspace -- -D warnings
 
 lint-fix:
     @just _cargo fix --allow-dirty --allow-staged
@@ -75,7 +75,10 @@ run-release *ARGS:
     @just _cargo run --release --bin aioncore -- {{ARGS}}
 
 # Pre-push gate: validate the candidate without changing tracked files
-push *ARGS: check
+push *ARGS: migration-check
+    @just _cargo clippy --locked --workspace -- -D warnings
+    @just fmt-check
+    @just _cargo nextest run --locked --workspace
     git push {{ARGS}}
 
 # Update aionrs dependency: bump Cargo.toml tag, then open a PR whose body

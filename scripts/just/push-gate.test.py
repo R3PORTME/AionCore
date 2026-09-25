@@ -148,7 +148,7 @@ class PushGateTest(unittest.TestCase):
         else:
             self.assertFalse(push_log.exists(), result.stdout + result.stderr)
 
-    def assert_locked_aionrs_wrapper(self, *command):
+    def set_up_aionrs(self, dirty_lock=False):
         aionrs = self.root / "aionrs"
         packages = []
         for crate in AIONRS_CRATES:
@@ -161,24 +161,44 @@ class PushGateTest(unittest.TestCase):
         self.env.update(AIONRS=str(aionrs), GATE_METADATA_JSON=str(metadata_path))
         (self.repo / "Cargo.lock").write_text("existing lockfile\n")
         self.run_command("git", "add", "Cargo.lock")
-        (self.repo / "Cargo.lock").write_text("existing dirty lockfile\n")
+        self.run_command("git", "commit", "-qm", "add clean lockfile")
+        if dirty_lock:
+            (self.repo / "Cargo.lock").write_text("existing dirty lockfile\n")
         (self.bin / "cargo").write_text(
             "#!/usr/bin/env bash\n"
             'printf "%s\\n" "$*" >> "$GATE_CARGO_LOG"\n'
             'if [[ " $* " == *" metadata "* ]]; then\n'
+            '  if [[ " $* " == *" --locked "* ]] && ! grep -q local-patch Cargo.lock; then\n'
+            '    echo "lockfile needs local patch" >&2\n'
+            '    exit 42\n'
+            '  fi\n'
             '  cat "$GATE_METADATA_JSON"\n'
             'elif [[ " $* " == *" update "* ]]; then\n'
-            '  printf "unexpected update\\n" >> Cargo.lock\n'
+            '  printf "local-patch\\n" >> Cargo.lock\n'
             'fi\n'
             'exit 0\n'
         )
+
+    def assert_development_aionrs(self):
+        self.set_up_aionrs()
+        before = self.identity()
+        for recipe in ("lint", "test"):
+            result = self.run_command("just", recipe)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.identity(), before, result.stdout + result.stderr)
+        calls = (self.root / "cargo.log").read_text().splitlines()
+        self.assertEqual(sum(" update " in f" {call} " for call in calls), 2, calls)
+        self.assertFalse(any(" --locked " in f" {call} " for call in calls), calls)
+
+    def assert_locked_aionrs_wrapper(self, *command):
+        self.set_up_aionrs(dirty_lock=True)
         before = self.identity()
         result = self.run_command(*command, "clippy", "--locked", "--workspace", "--", "-D", "warnings")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("AIONRS", result.stderr)
+        self.assertIn("unset", result.stderr.lower())
         self.assertEqual(self.identity(), before, result.stdout + result.stderr)
-        calls = (self.root / "cargo.log").read_text().splitlines()
-        self.assertTrue(any("metadata --format-version 1 --locked" in call for call in calls), calls)
-        self.assertFalse(any(" update " in f" {call} " for call in calls), calls)
+        self.assertFalse((self.root / "cargo.log").exists())
 
     def test_shell_success(self):
         self.assert_gate(expect_success=True)
@@ -197,8 +217,20 @@ class PushGateTest(unittest.TestCase):
         (self.repo / "crates/aionui-db/migrations/001_second.sql").write_text("SELECT 2;\n")
         self.assert_gate()
 
-    def test_shell_locked_aionrs_preserves_dirty_lockfile(self):
+    def test_shell_development_aionrs_resolves_clean_lockfile(self):
+        self.assert_development_aionrs()
+
+    def test_shell_locked_aionrs_fails_without_mutation(self):
         self.assert_locked_aionrs_wrapper("bash", "scripts/just/cargo.sh")
+
+    def test_shell_push_with_aionrs_fails_without_mutation(self):
+        self.set_up_aionrs()
+        before = self.identity()
+        result = self.run_command("just", "push", "-u", "origin", "candidate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("AIONRS", result.stderr)
+        self.assertEqual(self.identity(), before)
+        self.assertFalse((self.root / "push.log").exists())
 
     def test_explicit_auto_fix_is_development_only(self):
         before = self.git("rev-parse", "HEAD")
@@ -230,10 +262,24 @@ class PushGateTest(unittest.TestCase):
         (self.repo / "crates/aionui-db/migrations/001_second.sql").write_text("SELECT 2;\n")
         self.assert_gate()
 
-    def test_powershell_locked_aionrs_preserves_dirty_lockfile(self):
+    def test_powershell_development_aionrs_resolves_clean_lockfile(self):
+        self.use_powershell_path()
+        self.assert_development_aionrs()
+
+    def test_powershell_locked_aionrs_fails_without_mutation(self):
         if not shutil.which("pwsh"):
             self.skipTest("PowerShell is unavailable")
         self.assert_locked_aionrs_wrapper("pwsh", "-NoProfile", "-File", "scripts/just/cargo.ps1")
+
+    def test_powershell_push_with_aionrs_fails_without_mutation(self):
+        self.use_powershell_path()
+        self.set_up_aionrs()
+        before = self.identity()
+        result = self.run_command("just", "push", "-u", "origin", "candidate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("AIONRS", result.stderr)
+        self.assertEqual(self.identity(), before)
+        self.assertFalse((self.root / "push.log").exists())
 
 
 if __name__ == "__main__":

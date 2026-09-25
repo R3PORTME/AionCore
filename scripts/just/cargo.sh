@@ -5,13 +5,6 @@ cargo_config=()
 restore_cargo_lock=false
 cargo_lock_snapshot=""
 aionrs_root=""
-locked=false
-for arg in "$@"; do
-    if [[ "$arg" == "--locked" ]]; then
-        locked=true
-        break
-    fi
-done
 
 restore_local_lockfile() {
     local status=$?
@@ -32,11 +25,7 @@ trap restore_local_lockfile EXIT
 verify_local_aionrs_patch() {
     local metadata_file
     metadata_file=$(mktemp)
-    metadata_args=(metadata --format-version 1)
-    if [[ "$locked" == "true" ]]; then
-        metadata_args+=(--locked)
-    fi
-    cargo "${cargo_config[@]}" "${metadata_args[@]}" > "$metadata_file"
+    cargo "${cargo_config[@]}" metadata --format-version 1 > "$metadata_file"
 
     python3 - "$aionrs_root" "$metadata_file" "${crates[@]}" <<'PY'
 import json
@@ -70,6 +59,13 @@ PY
 }
 
 if [[ -n "${AIONRS:-}" ]]; then
+    for arg in "$@"; do
+        if [[ "$arg" == "--locked" ]]; then
+            echo "AIONRS cannot be used with --locked publication checks because resolving a local SDK patch may change Cargo.lock. Unset AIONRS and rerun just push; use just lint/test for local SDK development." >&2
+            exit 1
+        fi
+    done
+
     if [[ ! -d "$AIONRS" ]]; then
         echo "AIONRS does not exist or is not a directory: $AIONRS" >&2
         exit 1
@@ -104,32 +100,30 @@ if [[ -n "${AIONRS:-}" ]]; then
 
     echo "Using local aionrs SDK: $aionrs_root" >&2
 
-    if [[ "$locked" == "false" ]]; then
-        if [[ -f Cargo.lock ]]; then
-            cargo_lock_snapshot=$(mktemp)
-            cp Cargo.lock "$cargo_lock_snapshot"
+    if [[ -f Cargo.lock ]]; then
+        cargo_lock_snapshot=$(mktemp)
+        cp Cargo.lock "$cargo_lock_snapshot"
 
-            if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
-                restore_cargo_lock=true
-            else
-                echo "Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place." >&2
-            fi
+        if git diff --quiet -- Cargo.lock && git diff --cached --quiet -- Cargo.lock; then
+            restore_cargo_lock=true
+        else
+            echo "Cargo.lock already has changes; leaving successful AIONRS lockfile updates in place." >&2
         fi
-
-        echo "Resolving Cargo.lock against local aionrs SDK" >&2
-        cargo "${cargo_config[@]}" update \
-            -p aion-agent \
-            -p aion-compact \
-            -p aion-config \
-            -p aion-mcp \
-            -p aion-memory \
-            -p aion-process \
-            -p aion-protocol \
-            -p aion-providers \
-            -p aion-skills \
-            -p aion-tools \
-            -p aion-types
     fi
+
+    echo "Resolving Cargo.lock against local aionrs SDK" >&2
+    cargo "${cargo_config[@]}" update \
+        -p aion-agent \
+        -p aion-compact \
+        -p aion-config \
+        -p aion-mcp \
+        -p aion-memory \
+        -p aion-process \
+        -p aion-protocol \
+        -p aion-providers \
+        -p aion-skills \
+        -p aion-tools \
+        -p aion-types
     verify_local_aionrs_patch
 fi
 
