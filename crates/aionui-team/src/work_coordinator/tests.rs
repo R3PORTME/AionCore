@@ -519,7 +519,7 @@ fn remove_cancels_queued_and_running_work_and_rejects_new_enqueue() {
     enqueue(&coordinator, WorkSource::UserMessage, "m2");
 
     let removed = coordinator.remove_slot("lead-1");
-    assert_eq!(removed.cancel_target.unwrap().batch, first);
+    assert_eq!(removed.cancel_target.unwrap().batch, *first);
     assert_eq!(removed.terminal_message_ids, vec!["m1", "m2"]);
     assert!(coordinator.intents_for_slot("lead-1").iter().all(|intent| {
         intent.state
@@ -558,7 +558,7 @@ fn stale_generation_and_operation_cannot_commit() {
         coordinator.mark_started(&stale_operation, "turn-stale"),
         StartCommitResult::StaleOwner
     );
-    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(batch));
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(*batch));
 }
 
 #[test]
@@ -673,7 +673,7 @@ fn active_batch_prevents_unread_projection_from_being_rebuilt() {
     coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
 
     assert_eq!(coordinator.intents_for_slot("lead-1").len(), 1);
-    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(batch));
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(*batch));
 }
 
 #[test]
@@ -939,7 +939,7 @@ fn pause_cancels_running_batch_and_retains_queued_work() {
     recorder.slot_work.lock().unwrap().clear();
 
     let paused = coordinator.pause_slot("lead-1");
-    assert_eq!(paused.cancel_target.unwrap().batch, running);
+    assert_eq!(&paused.cancel_target.unwrap().batch, running.as_ref());
     {
         let snapshots = recorder.slot_work.lock().unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -1012,7 +1012,7 @@ fn cancel_run_terminalizes_every_associated_intent_and_lease() {
         .unwrap();
 
     let cancelled = coordinator.cancel_run("run-1");
-    assert_eq!(cancelled.cancel_targets[0].batch, running);
+    assert_eq!(&cancelled.cancel_targets[0].batch, running.as_ref());
     assert_eq!(cancelled.terminal_message_ids, vec!["running", "queued"]);
     assert_eq!(cancelled.summary.active_enqueue_lease_count, 0);
     assert_eq!(cancelled.summary.queued_intent_count, 0);
