@@ -2735,9 +2735,10 @@ impl TeamSessionService {
         slot_id: &str,
         expected_batch_id: &str,
         message_ids: &[String],
+        truncated_message_ids: &[String],
     ) -> Result<ObserveMessagesResult, TeamError> {
         self.published_session(team_id)?
-            .observe_agent_messages(slot_id, expected_batch_id, message_ids)
+            .observe_agent_messages(slot_id, expected_batch_id, message_ids, truncated_message_ids)
             .await
     }
 
