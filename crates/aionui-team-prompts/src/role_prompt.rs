@@ -31,7 +31,7 @@ or referring to teammates. Use `slot_id` values for agent target fields. The
 task-assignment `owner_name` field is an identity checksum and must carry the
 current display name from `team_members`. Use `team_task_list` when you need
 current task state.
-Call `team_read_messages` once near the start of each active Team turn before assigning work or replying to teammates. If the result has `has_more: true`, call it again with `since_message_id` set to the returned `next_since_message_id` until it is false. Do not call `team_read_messages`, `team_members`, or `team_task_list` repeatedly in the same turn merely to wait for a teammate. Do not act on a message with `content_truncated: true` yet; it will be redelivered in full.
+Call `team_read_messages` once near the start of each active Team turn before assigning work or replying to teammates. If the result has `has_more: true`, call it again with `since_message_id` set to the returned `next_since_message_id` until it is false. Do not call `team_read_messages`, `team_members`, or `team_task_list` repeatedly in the same turn merely to wait for a teammate. For a message with `content_truncated: true`, do not act on the preview unless `full_body_in_wake: true`; that flag means the full body was already delivered in this turn's wake. Otherwise the full body has not reached you yet and the message will be redelivered in full.
 
 ## Workflow
 1. Receive user request
@@ -271,7 +271,7 @@ Call `team_read_messages` once before you finish your turn, and again before
 replying to teammates, so you do not act on stale information. If the result has
 `has_more: true`, call it again with `since_message_id` set to the returned
 `next_since_message_id` until it is false. Do not act on a message with
-`content_truncated: true` yet; it will be redelivered in full.
+`content_truncated: true` unless `full_body_in_wake: true`; that flag means the full body was already delivered in this turn's wake. Otherwise the message will be redelivered in full.
 
 ## How to Work
 1. Read your unread messages to understand your assignment
@@ -387,6 +387,8 @@ mod tests {
         assert!(prompt.contains("team_list_assistants"));
         assert!(prompt.contains("owner_name` field is an identity checksum"));
         assert!(prompt.contains("Call `team_read_messages` once near the start of each active Team turn"));
+        assert!(prompt.contains("`full_body_in_wake: true`"));
+        assert!(prompt.contains("Otherwise the full body has not reached you yet"));
         assert!(prompt.contains("`next_since_message_id`"));
         assert!(prompt.contains("Do NOT poll with repeated"));
         assert!(prompt.contains("End the current turn immediately"));
@@ -428,6 +430,7 @@ mod tests {
         assert!(prompt.contains("Never pass a display name where a slot_id target is required"));
         assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
         assert!(prompt.contains("`content_truncated: true`"));
+        assert!(prompt.contains("`full_body_in_wake: true`"));
         assert!(prompt.contains("STOP GENERATING"));
         assert!(!prompt.contains("Teammates: Worker"));
     }
