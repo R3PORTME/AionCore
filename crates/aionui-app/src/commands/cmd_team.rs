@@ -1,12 +1,14 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use aionui_api_types::{
     TeamToolCliEnvelope, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolRuntimeCallRequest,
     tool_name_for_cli_path,
 };
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::cli::{TeamArgs, TeamCommand, TeamTaskCommand};
 use crate::commands::team_capabilities;
@@ -36,12 +38,8 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
         TeamCommand::Context => {
             let env = runtime_env("team context")?;
             let url = format!("{}/api/runtime/team-tools/context", env.base_url.trim_end_matches('/'));
-            let response = reqwest::Client::new()
-                .get(url)
-                .headers(env.headers())
-                .send()
-                .await
-                .map_err(|error| runtime_error("team context", "TEAM_CLI_HTTP_BRIDGE_FAILED", error.to_string()))?;
+            let response =
+                send_to_runtime(reqwest::Client::new().get(url).headers(env.headers()), "team context").await?;
             print_response(response).await
         }
         TeamCommand::Members => call_tool(vec!["members"]).await,
@@ -77,14 +75,64 @@ async fn call_tool(path: Vec<&'static str>) -> Result<(), ExitCode> {
         })?;
     let arguments = read_stdin_json_object(&command, tool)?;
     let url = format!("{}/api/runtime/team-tools/call", env.base_url.trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .post(url)
-        .headers(env.headers())
-        .json(&TeamToolRuntimeCallRequest { tool, arguments })
+    let response = send_to_runtime(
+        reqwest::Client::new()
+            .post(url)
+            .headers(env.headers())
+            .json(&TeamToolRuntimeCallRequest { tool, arguments }),
+        &command,
+    )
+    .await?;
+    print_response(response).await
+}
+
+async fn send_to_runtime(request: reqwest::RequestBuilder, command: &str) -> Result<reqwest::Response, ExitCode> {
+    // A connect error occurs before the request reaches the server, so even a
+    // state-changing Team call is safe to retry. Never retry an ambiguous
+    // response/body error: the server may already have applied the operation.
+    const CONNECT_BACKOFF: [Duration; 3] = [
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    ];
+    for (index, delay) in CONNECT_BACKOFF.iter().enumerate() {
+        match request
+            .try_clone()
+            .expect("Team JSON request body is repeatable")
+            .send()
+            .await
+        {
+            Ok(response) => return Ok(response),
+            Err(error) if error.is_connect() => sleep(*delay).await,
+            Err(error) => return Err(bridge_error(command, error, index + 1)),
+        }
+    }
+    request
         .send()
         .await
-        .map_err(|error| runtime_error(&command, "TEAM_CLI_HTTP_BRIDGE_FAILED", error.to_string()))?;
-    print_response(response).await
+        .map_err(|error| bridge_error(command, error, CONNECT_BACKOFF.len() + 1))
+}
+
+fn bridge_error(command: &str, error: reqwest::Error, attempts: usize) -> ExitCode {
+    let mut details = json!({
+        "attempts": attempts,
+        "connect_error": error.is_connect(),
+        "timeout": error.is_timeout(),
+    });
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            details["io_kind"] = json!(format!("{:?}", io_error.kind()));
+            details["os_error"] = json!(io_error.raw_os_error());
+            break;
+        }
+        source = cause.source();
+    }
+    print_failure(
+        command,
+        "TEAM_CLI_HTTP_BRIDGE_FAILED",
+        TeamToolErrorPayload::new(TeamToolErrorCode::TransportUnavailable, error.to_string()).with_details(details),
+    )
 }
 
 struct RuntimeEnv {
@@ -214,6 +262,14 @@ async fn print_response(response: reqwest::Response) -> Result<(), ExitCode> {
         return Err(ExitCode::from(3));
     }
     println!("{text}");
+    if serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|envelope| envelope.get("success").and_then(Value::as_bool))
+        == Some(false)
+    {
+        eprintln!("TEAM_CLI_RESPONSE_ERROR command=team: runtime bridge returned a failure envelope");
+        return Err(ExitCode::from(3));
+    }
     Ok(())
 }
 
