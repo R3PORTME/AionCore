@@ -151,9 +151,15 @@ mod tests {
         {
             assert_eq!(dir, override_dir, "log_dir should honor AIONUI_LOG_DIR");
         } else {
+            let default_suffix = if cfg!(target_os = "macos") && dirs::home_dir().is_some() {
+                std::path::Path::new("Library").join("Logs").join("aionui")
+            } else {
+                std::path::Path::new("aionui").join("logs")
+            };
             assert!(
-                std::path::Path::new(&dir).ends_with(std::path::Path::new("aionui").join("logs")),
-                "default log_dir should end in 'aionui/logs': {dir}"
+                std::path::Path::new(&dir).ends_with(&default_suffix),
+                "default log_dir should end in '{}': {dir}",
+                default_suffix.display()
             );
         }
     }
