@@ -614,7 +614,7 @@ impl SlotWorkCoordinator {
             is_command = batch.is_command,
             "team work batch claimed"
         );
-        ReconcileDecision::Claim(batch)
+        ReconcileDecision::Claim(Box::new(batch))
     }
 
     /// The batch that currently owns `slot_id`'s turn, if any. Captured at peek

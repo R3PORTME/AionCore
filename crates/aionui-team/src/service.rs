@@ -343,7 +343,7 @@ impl TeamSessionService {
     ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, TeamError> {
         let gate = self.lifecycle_gate(team_id);
         let observed_generation = gate.generation.load(Ordering::Acquire);
-        if observed_generation % 2 != 0 {
+        if !observed_generation.is_multiple_of(2) {
             return Err(TeamError::InvalidRequest(
                 "team fresh run is in progress; retry after it completes".to_owned(),
             ));
@@ -351,7 +351,7 @@ impl TeamSessionService {
 
         let guard = Arc::clone(&gate.lock).read_owned().await;
         let current_generation = gate.generation.load(Ordering::Acquire);
-        if current_generation != observed_generation || current_generation % 2 != 0 {
+        if current_generation != observed_generation || !current_generation.is_multiple_of(2) {
             drop(guard);
             return Err(TeamError::InvalidRequest(
                 "team lifecycle changed while the request was waiting; retry the request".to_owned(),
@@ -2436,7 +2436,7 @@ impl TeamSessionService {
         let gate = self.lifecycle_gate(team_id);
         let _lifecycle_guard = Arc::clone(&gate.lock).write_owned().await;
         let previous_generation = gate.generation.fetch_add(1, Ordering::AcqRel);
-        if previous_generation % 2 != 0 {
+        if !previous_generation.is_multiple_of(2) {
             gate.generation.fetch_add(1, Ordering::AcqRel);
             return Err(TeamError::InvalidRequest(
                 "team lifecycle generation was already resetting".to_owned(),

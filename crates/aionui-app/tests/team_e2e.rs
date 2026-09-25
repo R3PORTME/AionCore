@@ -1850,10 +1850,7 @@ async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
     ] {
         let extra = conversation_extra(&services, fresh_conversation_id).await;
         assert_eq!(extra["workspace"], workspace_string);
-        assert_eq!(
-            extra["team_issue_previous_conversation_id"],
-            previous_conversation_id
-        );
+        assert_eq!(extra["team_issue_previous_conversation_id"], previous_conversation_id);
     }
 
     let old_history_count: i64 = sqlx::query_scalar(
@@ -1866,14 +1863,12 @@ async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
     .fetch_one(services.database.pool())
     .await
     .unwrap();
-    let fresh_history_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)",
-    )
-    .bind(fresh_lead_conversation_id)
-    .bind(fresh_worker_conversation_id)
-    .fetch_one(services.database.pool())
-    .await
-    .unwrap();
+    let fresh_history_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)")
+        .bind(fresh_lead_conversation_id)
+        .bind(fresh_worker_conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
     assert_eq!(old_history_count, 2, "previous Issue history must be preserved");
     assert_eq!(fresh_history_count, 0, "new Issue conversations must start blank");
 

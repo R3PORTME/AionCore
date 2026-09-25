@@ -379,6 +379,7 @@ impl TeamSession {
 
         match self.work_coordinator.next(slot_id) {
             ReconcileDecision::Claim(batch) => {
+                let batch = *batch;
                 let claimed_rows = match self
                     .mailbox
                     .peek_unread_by_ids(&self.team.id, slot_id, &batch.mailbox_message_ids)

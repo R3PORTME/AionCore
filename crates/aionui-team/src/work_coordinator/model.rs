@@ -198,7 +198,7 @@ pub(crate) struct WorkBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReconcileDecision {
-    Claim(WorkBatch),
+    Claim(Box<WorkBatch>),
     WaitingForCompletion,
     Blocked(RuntimeConstraint),
     SettleSignals(Vec<String>),

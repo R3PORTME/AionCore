@@ -128,9 +128,7 @@ async fn publish_resume_response(
 fn codex_current_mode_seed(config_mode: Option<&str>, opened_fresh: bool) -> Option<String> {
     let requested = config_mode.map(codex_perm::mode_to_catalog_value);
     if opened_fresh {
-        Some(requested.unwrap_or_else(|| {
-            codex_perm::profile_id_to_legacy_value(":workspace")
-        }))
+        Some(requested.unwrap_or_else(|| codex_perm::profile_id_to_legacy_value(":workspace")))
     } else {
         requested
     }
@@ -263,8 +261,7 @@ impl BackendConnection for CodexConnection {
                     ..
                 }
         );
-        backend.capabilities.current_mode =
-            codex_current_mode_seed(config.mode.as_deref(), starts_fresh);
+        backend.capabilities.current_mode = codex_current_mode_seed(config.mode.as_deref(), starts_fresh);
 
         // JSON-RPC handshake over the retained stdin (the reader task is already
         // draining stdout). REAL codex 0.137.0 wire (verified against the
@@ -327,8 +324,7 @@ impl BackendConnection for CodexConnection {
                     );
                     backend.recover_dead_resume_as_fresh().await?;
                     opened_fresh = true;
-                    backend.capabilities.current_mode =
-                        codex_current_mode_seed(config.mode.as_deref(), true);
+                    backend.capabilities.current_mode = codex_current_mode_seed(config.mode.as_deref(), true);
                 }
                 Err(err) => return Err(err),
             }
@@ -2092,8 +2088,7 @@ async fn reader_task(
                                     error = %msg,
                                     "codex thread/fork rejected — poisoning bound-thread wait (no silent fallback)"
                                 );
-                                resume_handshake.lock().await.poison =
-                                    Some(format!("codex thread/fork failed: {msg}"));
+                                resume_handshake.lock().await.poison = Some(format!("codex thread/fork failed: {msg}"));
                                 continue;
                             }
                             let pending_send = pending_sends.lock().await.remove(&rid);
@@ -5029,10 +5024,7 @@ mod tests {
         let state = backend.resume_handshake.lock().await;
         assert_eq!(state.pending_rpc_id, Some(8));
         assert_eq!(state.poison, None);
-        assert_eq!(
-            backend.thread_binding.lock().await.as_deref(),
-            Some("th-new")
-        );
+        assert_eq!(backend.thread_binding.lock().await.as_deref(), Some("th-new"));
         drop(state);
         assert!(matches!(
             backend.bound_thread_within(std::time::Duration::from_millis(1)).await,
@@ -9337,8 +9329,7 @@ mod tests {
         let fake = FakeAgentIo::never_exits(Vec::new());
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-resume-fallback", Box::new(fake)).await;
-        backend.resume_handshake.lock().await.poison =
-            Some("codex thread/resume failed: no rollout found".into());
+        backend.resume_handshake.lock().await.poison = Some("codex thread/resume failed: no rollout found".into());
         backend.seed_thread_binding_for_test("th-dead").await;
 
         let binding = backend.thread_binding.clone();
