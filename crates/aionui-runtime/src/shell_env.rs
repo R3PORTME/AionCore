@@ -579,35 +579,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn login_shell_path_roundtrip_with_sh() {
-        // A login shell reads startup files, so give it a known PATH entry
-        // instead of inheriting the developer's profile or interactive ENV.
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(home.path().join("probe-bin")).unwrap();
+    fn login_shell_path_roundtrip_with_controlled_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A real login shell can also source /etc/profile and /etc/profile.d,
+        // regardless of HOME. This executable checks the production invocation
+        // without loading login or interactive startup files.
+        const EXPECTED_PATH: &str = "/opt/aionui/hermetic-probe-bin:/usr/bin";
+        let temp = tempfile::TempDir::new().unwrap();
+        let executable = temp.path().join("login-shell-probe");
         std::fs::write(
-            home.path().join(".profile"),
-            "PATH=\"$HOME/probe-bin:/usr/bin:/bin\"\nexport PATH\n",
+            &executable,
+            r##"#!/bin/sh
+if [ "$#" -ne 4 ] || [ "$1" != "-l" ] || [ "$2" != "-i" ] || [ "$3" != "-c" ] || [ "$4" != 'printf %s "$PATH"' ]; then
+    exit 64
+fi
+printf '%s' '/opt/aionui/hermetic-probe-bin:/usr/bin'
+"##,
         )
         .unwrap();
-        let empty_env = home.path().join("empty-env");
-        std::fs::write(&empty_env, "").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         if !run_in_env_child(
-            "shell_env::tests::login_shell_path_roundtrip_with_sh",
-            &[
-                ("SHELL", "/bin/sh"),
-                ("HOME", home.path().to_str().unwrap()),
-                ("ENV", empty_env.to_str().unwrap()),
-            ],
-            &[],
+            "shell_env::tests::login_shell_path_roundtrip_with_controlled_executable",
+            &[("SHELL", executable.to_str().unwrap())],
+            &["ENV", "BASH_ENV"],
         ) {
             return;
         }
         let (result, report) = login_shell_path();
-        assert!(result.is_some(), "login shell probe should return Some");
-        let path = result.unwrap();
-        let expected_bin = std::path::Path::new(&std::env::var("HOME").unwrap()).join("probe-bin");
-        assert_eq!(path.split(':').next(), expected_bin.to_str());
+        assert_eq!(result.as_deref(), Some(EXPECTED_PATH));
         assert_eq!(report.status, ShellProbeStatus::Ok);
     }
 
