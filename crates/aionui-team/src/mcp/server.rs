@@ -608,10 +608,12 @@ const INBOX_TRUNCATION_MARKER: &str = "\n[truncated]";
 const INBOX_TRUNCATION_NOTE: &str = "Content exceeded the inbox preview limit and was truncated. \
      This message stays unread and will be redelivered in full on a later turn; \
      do not act on this preview alone.";
+const INBOX_WAKE_PREVIEW_NOTE: &str =
+    "This tool preview is truncated, but the full message body was delivered in this turn's wake.";
 
 /// One page of the caller's unread mailbox, oldest first.
 #[derive(Debug)]
-struct InboxPage {
+pub(crate) struct InboxPage {
     messages: Vec<MailboxMessage>,
     /// Every unread row the caller has, independent of cursor or page size.
     total_unread_count: usize,
@@ -621,11 +623,14 @@ struct InboxPage {
 
 /// A rendered page plus the subset of rows that may be acknowledged with the
 /// current turn.
-struct RenderedInbox {
-    value: Value,
-    /// Rows returned in full. Truncated rows are deliberately excluded so they
-    /// stay unread and get redelivered whole through the normal delivery path.
-    observable_message_ids: Vec<String>,
+pub(crate) struct RenderedInbox {
+    pub(crate) value: Value,
+    /// Rows returned in full and eligible to be acknowledged with this turn.
+    pub(crate) observable_message_ids: Vec<String>,
+    /// Rows whose bounded tool previews are truncated. The coordinator uses
+    /// active-batch ownership to distinguish already-delivered bodies from rows
+    /// that still need a later full delivery.
+    pub(crate) truncated_message_ids: Vec<String>,
 }
 
 async fn exec_read_messages(
@@ -650,15 +655,21 @@ async fn exec_read_messages(
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))?;
     let page = inbox_page(peek.messages, since_message_id)?;
-    let rendered = render_inbox_page(page);
+    let rendered = render_inbox_page_with_wake_messages(page, &peek.full_body_message_ids);
 
     // `batch_id` is `None` when no turn owned the slot at peek time (e.g. a CLI
     // read outside a turn); nothing can be acknowledged, so every row stays unread.
     if let Some(batch_id) = &peek.batch_id
-        && !rendered.observable_message_ids.is_empty()
+        && (!rendered.observable_message_ids.is_empty() || !rendered.truncated_message_ids.is_empty())
     {
         service
-            .observe_agent_messages(team_id, caller_slot_id, batch_id, &rendered.observable_message_ids)
+            .observe_agent_messages(
+                team_id,
+                caller_slot_id,
+                batch_id,
+                &rendered.observable_message_ids,
+                &rendered.truncated_message_ids,
+            )
             .await
             .map_err(|error| ToolCallError::from_message(error.to_string()))?;
     }
@@ -667,7 +678,10 @@ async fn exec_read_messages(
 
 /// Takes the **oldest** unread rows so processing order matches arrival order.
 /// `since_message_id` advances the window past a row the caller already saw.
-fn inbox_page(messages: Vec<MailboxMessage>, since_message_id: Option<&str>) -> Result<InboxPage, ToolCallError> {
+pub(crate) fn inbox_page(
+    messages: Vec<MailboxMessage>,
+    since_message_id: Option<&str>,
+) -> Result<InboxPage, ToolCallError> {
     let total_unread_count = messages.len();
     let after_cursor = match since_message_id {
         None => messages,
@@ -693,21 +707,28 @@ fn inbox_page(messages: Vec<MailboxMessage>, since_message_id: Option<&str>) -> 
     })
 }
 
-fn render_inbox_page(page: InboxPage) -> RenderedInbox {
+#[cfg(test)]
+pub(crate) fn render_inbox_page(page: InboxPage) -> RenderedInbox {
+    render_inbox_page_with_wake_messages(page, &[])
+}
+
+pub(crate) fn render_inbox_page_with_wake_messages(page: InboxPage, full_body_message_ids: &[String]) -> RenderedInbox {
     let InboxPage {
         messages,
         total_unread_count,
         remaining_after_page,
     } = page;
     let mut observable_message_ids = Vec::new();
+    let mut truncated_message_ids = Vec::new();
     let mut last_message_id = None;
     let messages = messages
         .into_iter()
         .map(|message| {
             let (content, content_truncated) = truncate_inbox_content(&message.content);
+            let full_body_in_wake = full_body_message_ids.contains(&message.id);
             if content_truncated {
-                // Left out of the acknowledged set on purpose — see RenderedInbox.
-            } else {
+                truncated_message_ids.push(message.id.clone());
+            } else if !content_truncated {
                 observable_message_ids.push(message.id.clone());
             }
             last_message_id = Some(message.id.clone());
@@ -717,11 +738,16 @@ fn render_inbox_page(page: InboxPage) -> RenderedInbox {
                 "type": message.msg_type,
                 "content": content,
                 "content_truncated": content_truncated,
+                "full_body_in_wake": full_body_in_wake,
                 "files": message.files.unwrap_or_default(),
                 "created_at": message.created_at,
             });
             if content_truncated {
-                item["note"] = json!(INBOX_TRUNCATION_NOTE);
+                item["note"] = json!(if full_body_in_wake {
+                    INBOX_WAKE_PREVIEW_NOTE
+                } else {
+                    INBOX_TRUNCATION_NOTE
+                });
             }
             item
         })
@@ -737,6 +763,7 @@ fn render_inbox_page(page: InboxPage) -> RenderedInbox {
             "next_since_message_id": if has_more { last_message_id } else { None },
         }),
         observable_message_ids,
+        truncated_message_ids,
     }
 }
 
@@ -768,6 +795,47 @@ async fn resolve_agent_target(
             "Invalid agent target '{target}': expected slot_id. Call team_members to get slot_id."
         ))
     }
+}
+
+fn resolve_task_owner_from_agents(
+    agents: &[TeamAgent],
+    owner: Option<&str>,
+    owner_name: Option<&str>,
+) -> Result<Option<String>, ToolCallError> {
+    match (owner, owner_name) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(ToolCallError::from_message(
+            "Invalid params: owner_name is required when owner is provided",
+        )),
+        (None, Some(_)) => Err(ToolCallError::from_message(
+            "Invalid params: owner is required when owner_name is provided",
+        )),
+        (Some(slot_id), Some(display_name)) => {
+            let agent = agents.iter().find(|agent| agent.slot_id == slot_id).ok_or_else(|| {
+                ToolCallError::from_message(format!(
+                    "Invalid agent target '{slot_id}': expected current teammate slot_id. Call team_members to refresh the roster."
+                ))
+            })?;
+            let expected_name = crate::scheduler::normalize_name(&agent.name);
+            let provided_name = crate::scheduler::normalize_name(display_name);
+            if provided_name.is_empty() || provided_name != expected_name {
+                return Err(ToolCallError::from_message(format!(
+                    "Invalid params: owner_name '{display_name}' does not match owner slot_id '{slot_id}' (current display name '{}')",
+                    agent.name
+                )));
+            }
+            Ok(Some(slot_id.to_owned()))
+        }
+    }
+}
+
+async fn resolve_task_owner(
+    scheduler: &TeammateManager,
+    owner: Option<&str>,
+    owner_name: Option<&str>,
+) -> Result<Option<String>, ToolCallError> {
+    let agents = scheduler.list_agents().await;
+    resolve_task_owner_from_agents(&agents, owner, owner_name)
 }
 
 async fn exec_send_message(
@@ -1171,11 +1239,13 @@ async fn exec_task_create(
     let input: TaskCreateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
+    let owner = resolve_task_owner(scheduler, input.owner.as_deref(), input.owner_name.as_deref()).await?;
+
     let task = scheduler
         .create_task(
             &input.subject,
             input.description.as_deref(),
-            input.owner.as_deref(),
+            owner.as_deref(),
             &input.blocked_by.unwrap_or_default(),
         )
         .await
@@ -1198,7 +1268,8 @@ async fn exec_task_update(
     let input: TaskUpdateInput = serde_json::from_value(args.clone())
         .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
 
-    let reassigned = input.owner.is_some();
+    let owner = resolve_task_owner(scheduler, input.owner.as_deref(), input.owner_name.as_deref()).await?;
+    let reassigned = owner.is_some();
     let completed = input.status.as_deref() == Some("completed");
 
     let task = scheduler
@@ -1206,7 +1277,7 @@ async fn exec_task_update(
             &input.task_id,
             input.status.as_deref(),
             input.description,
-            input.owner,
+            owner,
             input.blocked_by,
         )
         .await
@@ -1607,6 +1678,49 @@ mod tests {
         render_inbox_page(inbox_page(messages, since_message_id).expect("page builds"))
     }
 
+    fn teammate(slot_id: &str, name: &str) -> TeamAgent {
+        TeamAgent {
+            slot_id: slot_id.to_owned(),
+            name: name.to_owned(),
+            role: TeammateRole::Teammate,
+            conversation_id: format!("conversation-{slot_id}"),
+            backend: "acp".into(),
+            model: "test-model".into(),
+            assistant_id: Some(format!("assistant-{slot_id}")),
+            status: Some(TeammateStatus::Idle),
+            conversation_type: None,
+            cli_path: None,
+        }
+    }
+
+    #[test]
+    fn task_owner_identity_accepts_matching_slot_and_display_name() {
+        let agents = vec![teammate("slot-luna", "Codex Coder Luna")];
+        let owner = resolve_task_owner_from_agents(&agents, Some("slot-luna"), Some("Codex Coder Luna"))
+            .expect("matching identity pair should resolve");
+        assert_eq!(owner.as_deref(), Some("slot-luna"));
+    }
+
+    #[test]
+    fn task_owner_identity_rejects_wrong_valid_slot_for_requested_name() {
+        let agents = vec![
+            teammate("slot-sol", "Codex Coder Sol"),
+            teammate("slot-claude", "Claude Code"),
+        ];
+        let error = resolve_task_owner_from_agents(&agents, Some("slot-sol"), Some("Claude Code"))
+            .expect_err("slot/name mismatch must fail closed");
+        assert!(error.message.starts_with("Invalid params:"));
+        assert!(error.message.contains("does not match"));
+    }
+
+    #[test]
+    fn task_owner_identity_requires_both_fields_when_assigning() {
+        let agents = vec![teammate("slot-luna", "Codex Coder Luna")];
+        assert!(resolve_task_owner_from_agents(&agents, Some("slot-luna"), None).is_err());
+        assert!(resolve_task_owner_from_agents(&agents, None, Some("Codex Coder Luna")).is_err());
+        assert_eq!(resolve_task_owner_from_agents(&agents, None, None).unwrap(), None);
+    }
+
     #[test]
     fn read_messages_json_returns_fifo_messages_and_an_explicit_empty_list() {
         let rendered = render(vec![inbox_message(1, "first"), inbox_message(2, "second")], None);
@@ -1705,6 +1819,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inbox_content_at_and_below_the_preview_limit_is_returned_in_full() {
+        let messages = vec![
+            inbox_message(1, "x".repeat(MAX_INBOX_CONTENT_CHARS - 1)),
+            inbox_message(2, "x".repeat(MAX_INBOX_CONTENT_CHARS)),
+        ];
+
+        let rendered = render(messages, None);
+
+        assert_eq!(rendered.value["messages"][0]["content_truncated"], false);
+        assert_eq!(rendered.value["messages"][1]["content_truncated"], false);
+        assert_eq!(
+            rendered.observable_message_ids,
+            vec!["message-01".to_owned(), "message-02".to_owned()]
+        );
+        assert!(rendered.truncated_message_ids.is_empty());
+    }
+
+    #[test]
+    fn truncated_oldest_message_remains_reachable_across_cursor_pagination() {
+        let messages = (0..=MAX_INBOX_MESSAGES)
+            .map(|index| {
+                let content = if index == 0 {
+                    "oldest terminal result ".repeat(200)
+                } else {
+                    format!("message {index}")
+                };
+                inbox_message(index, content)
+            })
+            .collect::<Vec<_>>();
+
+        let first_page = render_inbox_page(inbox_page(messages.clone(), None).expect("first page builds"));
+        assert_eq!(first_page.value["messages"][0]["content_truncated"], true);
+        assert_eq!(first_page.value["has_more"], true);
+        assert_eq!(first_page.value["next_since_message_id"], "message-49");
+        assert_eq!(first_page.truncated_message_ids, vec!["message-00"]);
+
+        let second_page = render_inbox_page(
+            inbox_page(messages.clone(), first_page.value["next_since_message_id"].as_str())
+                .expect("cursor page builds"),
+        );
+        assert_eq!(second_page.value["messages"][0]["message_id"], "message-50");
+
+        let restarted = render_inbox_page(inbox_page(messages, None).expect("restart from oldest builds"));
+        assert_eq!(restarted.value["messages"][0]["message_id"], "message-00");
+        assert_eq!(restarted.truncated_message_ids, vec!["message-00"]);
+    }
+
     /// P2: a truncated row is a preview only. It must stay unread so the normal
     /// delivery path re-delivers the whole body, otherwise the tail of a long
     /// message is lost the moment the turn succeeds.
@@ -1724,6 +1886,7 @@ mod tests {
             vec!["message-01".to_owned(), "message-03".to_owned()],
             "only fully-returned rows may be acknowledged"
         );
+        assert_eq!(rendered.truncated_message_ids, vec!["message-02"]);
 
         let truncated = &rendered.value["messages"][1];
         assert_eq!(truncated["message_id"], "message-02");
@@ -1739,6 +1902,26 @@ mod tests {
             rendered.value["messages"][0].get("note").is_none(),
             "untruncated rows carry no note"
         );
+    }
+
+    #[test]
+    fn truncated_preview_for_a_wake_delivered_row_does_not_signal_future_holdback() {
+        let message_id = "message-02".to_owned();
+        let rendered = render_inbox_page_with_wake_messages(
+            inbox_page(vec![inbox_message(2, "x".repeat(MAX_INBOX_CONTENT_CHARS + 1))], None).expect("page builds"),
+            std::slice::from_ref(&message_id),
+        );
+
+        let item = &rendered.value["messages"][0];
+        assert_eq!(item["content_truncated"], true, "the tool preview remains bounded");
+        assert_eq!(item["full_body_in_wake"], true);
+        assert!(item["content"].as_str().unwrap().ends_with(INBOX_TRUNCATION_MARKER));
+        assert_eq!(rendered.truncated_message_ids, vec![message_id]);
+        assert!(rendered.observable_message_ids.is_empty());
+        let note = item["note"].as_str().unwrap();
+        assert!(note.contains("full message body was delivered in this turn's wake"));
+        assert!(!note.contains("will be redelivered in full on a later turn"));
+        assert!(!note.contains("do not act on this preview alone"));
     }
 
     #[test]

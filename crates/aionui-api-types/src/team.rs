@@ -116,6 +116,16 @@ pub struct RenameTeamRequest {
     pub name: String,
 }
 
+/// Request body for `POST /api/teams/:id/fresh-run`.
+///
+/// Starts a new logical work run with the existing team roster while moving
+/// every member to a fresh backend context rooted at `workspace`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamFreshRunRequest {
+    pub workspace: String,
+}
+
 // ---------------------------------------------------------------------------
 // B. Agent management — Request DTOs
 // ---------------------------------------------------------------------------
@@ -540,6 +550,14 @@ pub struct TeamContextResetResponse {
     pub reset_status: TeamContextResetStatus,
     pub runtime_status: TeamContextResetRuntimeStatus,
     pub preserved_unread_count: usize,
+}
+
+/// Result of rebuilding a persisted team for a new logical work run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamFreshRunResponse {
+    pub workspace: String,
+    pub member_count: usize,
+    pub cleared_context_anchors: usize,
 }
 
 /// Semantic payload persisted for a localized team context-reset system notice.

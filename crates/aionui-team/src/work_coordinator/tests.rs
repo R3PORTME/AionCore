@@ -106,6 +106,46 @@ fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
 }
 
 #[test]
+fn fresh_run_quiesce_blocks_new_enqueue_when_idle() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+
+    coordinator.quiesce_for_fresh_run().unwrap();
+
+    let error = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("session stopped"));
+}
+
+#[test]
+fn fresh_run_quiesce_rejects_pending_enqueue_lease_without_mutating_slot() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .unwrap();
+
+    let error = coordinator.quiesce_for_fresh_run().unwrap_err();
+    assert!(error.to_string().contains("active or pending work"));
+
+    let committed = coordinator
+        .commit_enqueue(&lease, Some("user-message-1".into()))
+        .unwrap();
+    assert_eq!(committed.disposition, EnqueueDisposition::Accepted);
+}
+
+#[test]
 fn priority_lanes_claim_foreground_then_control_then_directed_then_background() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
@@ -479,7 +519,7 @@ fn remove_cancels_queued_and_running_work_and_rejects_new_enqueue() {
     enqueue(&coordinator, WorkSource::UserMessage, "m2");
 
     let removed = coordinator.remove_slot("lead-1");
-    assert_eq!(removed.cancel_target.unwrap().batch, first);
+    assert_eq!(removed.cancel_target.unwrap().batch, *first);
     assert_eq!(removed.terminal_message_ids, vec!["m1", "m2"]);
     assert!(coordinator.intents_for_slot("lead-1").iter().all(|intent| {
         intent.state
@@ -518,7 +558,7 @@ fn stale_generation_and_operation_cannot_commit() {
         coordinator.mark_started(&stale_operation, "turn-stale"),
         StartCommitResult::StaleOwner
     );
-    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(batch));
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(*batch));
 }
 
 #[test]
@@ -633,7 +673,7 @@ fn active_batch_prevents_unread_projection_from_being_rebuilt() {
     coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
 
     assert_eq!(coordinator.intents_for_slot("lead-1").len(), 1);
-    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(batch));
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, Some(*batch));
 }
 
 #[test]
@@ -647,7 +687,7 @@ fn observed_messages_complete_with_the_active_batch_and_do_not_requeue() {
     assert_eq!(coordinator.mark_started(&batch, "turn-1"), StartCommitResult::Accepted);
     enqueue(&coordinator, WorkSource::UserMessage, "late");
 
-    let observed = coordinator.observe_messages("lead-1", &batch.batch_id, &["initial".into(), "late".into()]);
+    let observed = coordinator.observe_messages("lead-1", &batch.batch_id, &["initial".into(), "late".into()], &[]);
     assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
     assert_eq!(
         observed.observed_count, 1,
@@ -676,6 +716,78 @@ fn observed_messages_complete_with_the_active_batch_and_do_not_requeue() {
 }
 
 #[test]
+fn fully_observed_rows_override_a_truncated_observation() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+
+    let observed = coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()], &["late".into()]);
+    assert_eq!(
+        observed.observed_count, 1,
+        "the full row wins over its preview classification"
+    );
+    let active = coordinator.slot_snapshot("lead-1").unwrap().active_batch.unwrap();
+    assert_eq!(active.deferred_message_ids, Vec::<String>::new());
+    assert_eq!(active.observed_message_ids, vec!["late"]);
+
+    let completion = coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(completion.ack_message_ids, vec!["initial", "late"]);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
+}
+
+#[test]
+fn previously_deferred_rows_can_complete_after_failed_redelivery() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("the initial row must be claimed");
+    };
+    enqueue(&coordinator, WorkSource::UserMessage, "long-review");
+    coordinator.observe_messages("lead-1", &first.batch_id, &[], &["long-review".into()]);
+    assert_eq!(
+        coordinator.complete_batch_with_ack(&first).ack_message_ids,
+        vec!["initial"]
+    );
+
+    coordinator.reconcile_mailbox("lead-1", &["long-review".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(recovery) = coordinator.next("lead-1") else {
+        panic!("the deferred review must be redelivered");
+    };
+    assert_eq!(recovery.redelivered_deferred_message_ids, vec!["long-review"]);
+    coordinator.observe_messages("lead-1", &recovery.batch_id, &[], &["long-review".into()]);
+    assert_eq!(
+        coordinator
+            .slot_snapshot("lead-1")
+            .unwrap()
+            .active_batch
+            .unwrap()
+            .deferred_message_ids,
+        Vec::<String>::new(),
+        "claimed rows are preview-truncated but not held back after full wake delivery"
+    );
+    assert_eq!(
+        coordinator.fail_batch(&recovery, "turn_failed").commit_result,
+        CommitResult::Committed
+    );
+
+    coordinator.reconcile_mailbox("lead-1", &["long-review".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("the failed redelivery must remain recoverable");
+    };
+    assert_eq!(retry.redelivered_deferred_message_ids, vec!["long-review"]);
+    coordinator.observe_messages("lead-1", &retry.batch_id, &[], &["long-review".into()]);
+    let completion = coordinator.complete_batch_with_ack(&retry);
+    assert_eq!(completion.ack_message_ids, vec!["long-review"]);
+    coordinator.reconcile_mailbox("lead-1", &[], TeamRunTargetRole::Lead);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
+}
+
+#[test]
 fn observed_messages_remain_queued_when_the_active_batch_fails() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
@@ -685,7 +797,7 @@ fn observed_messages_remain_queued_when_the_active_batch_fails() {
     };
     coordinator.mark_started(&batch, "turn-1");
     enqueue(&coordinator, WorkSource::UserMessage, "late");
-    coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()]);
+    coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()], &[]);
 
     let failure = coordinator.fail_batch(&batch, "turn_failed");
     assert_eq!(failure.commit_result, CommitResult::Committed);
@@ -706,7 +818,7 @@ fn observed_messages_remain_queued_when_the_active_batch_is_cancelled_or_interru
         };
         coordinator.mark_started(&batch, "turn-1");
         enqueue(&coordinator, WorkSource::UserMessage, "late");
-        coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()]);
+        coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()], &[]);
 
         if interruption {
             assert_eq!(
@@ -755,7 +867,7 @@ fn observations_from_a_replaced_turn_are_dropped_instead_of_rebound() {
     assert_ne!(first.batch_id, second.batch_id);
 
     // The in-flight tool call finally lands, still carrying the old batch id.
-    let observed = coordinator.observe_messages("lead-1", &first.batch_id, &["late".into()]);
+    let observed = coordinator.observe_messages("lead-1", &first.batch_id, &["late".into()], &[]);
     assert_eq!(observed.batch_id, None, "a stale observation is rejected");
     assert_eq!(observed.observed_count, 0);
     assert!(
@@ -800,7 +912,7 @@ fn messages_arriving_after_observation_are_left_for_the_next_batch() {
     };
     coordinator.mark_started(&batch, "turn-1");
     enqueue(&coordinator, WorkSource::UserMessage, "observed");
-    coordinator.observe_messages("lead-1", &batch.batch_id, &["observed".into()]);
+    coordinator.observe_messages("lead-1", &batch.batch_id, &["observed".into()], &[]);
     enqueue(&coordinator, WorkSource::UserMessage, "after-read");
 
     let completion = coordinator.complete_batch_with_ack(&batch);
@@ -827,7 +939,7 @@ fn pause_cancels_running_batch_and_retains_queued_work() {
     recorder.slot_work.lock().unwrap().clear();
 
     let paused = coordinator.pause_slot("lead-1");
-    assert_eq!(paused.cancel_target.unwrap().batch, running);
+    assert_eq!(&paused.cancel_target.unwrap().batch, running.as_ref());
     {
         let snapshots = recorder.slot_work.lock().unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -900,7 +1012,7 @@ fn cancel_run_terminalizes_every_associated_intent_and_lease() {
         .unwrap();
 
     let cancelled = coordinator.cancel_run("run-1");
-    assert_eq!(cancelled.cancel_targets[0].batch, running);
+    assert_eq!(&cancelled.cancel_targets[0].batch, running.as_ref());
     assert_eq!(cancelled.terminal_message_ids, vec!["running", "queued"]);
     assert_eq!(cancelled.summary.active_enqueue_lease_count, 0);
     assert_eq!(cancelled.summary.queued_intent_count, 0);
@@ -1048,6 +1160,84 @@ fn lead_intervention_interrupts_active_batch_and_runs_before_retained_queue() {
         panic!("older queued work must be retained");
     };
     assert_eq!(retained.mailbox_message_ids, vec!["older-queued"]);
+}
+
+#[test]
+fn interrupted_batch_does_not_consume_a_truncated_claimed_message() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "long-review");
+    let ReconcileDecision::Claim(active) = coordinator.next("lead-1") else {
+        panic!("the long review must be claimed");
+    };
+    coordinator.observe_messages("lead-1", &active.batch_id, &[], &["long-review".into()]);
+
+    let interrupted = coordinator.interrupt_batch(&active, Some("user update".into()), "replacement".into());
+    assert_eq!(interrupted.commit_result, CommitResult::Committed);
+    assert!(
+        interrupted.terminal_message_ids.is_empty(),
+        "a truncated claimed row must remain unread through interruption"
+    );
+
+    coordinator.reconcile_mailbox("lead-1", &["long-review".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(recovery) = coordinator.next("lead-1") else {
+        panic!("the truncated review must be recoverable after interruption");
+    };
+    assert_eq!(recovery.mailbox_message_ids, vec!["long-review"]);
+    assert!(recovery.redelivered_deferred_message_ids.is_empty());
+    coordinator.observe_messages("lead-1", &recovery.batch_id, &[], &["long-review".into()]);
+    let interrupted = coordinator.interrupt_batch(&recovery, Some("another update".into()), "next-work".into());
+    assert!(
+        interrupted.terminal_message_ids.is_empty(),
+        "an interrupted redelivery remains unread"
+    );
+
+    coordinator.reconcile_mailbox("lead-1", &["long-review".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("an interrupted redelivery must remain recoverable");
+    };
+    assert!(retry.redelivered_deferred_message_ids.is_empty());
+    coordinator.observe_messages("lead-1", &retry.batch_id, &[], &["long-review".into()]);
+    assert_eq!(
+        coordinator.complete_batch_with_ack(&retry).ack_message_ids,
+        vec!["long-review"]
+    );
+}
+
+#[test]
+fn deferred_marker_survives_interruption_during_full_wake_redelivery() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("the initial row must be claimed");
+    };
+    enqueue(&coordinator, WorkSource::UserMessage, "long-review");
+    coordinator.observe_messages("lead-1", &first.batch_id, &[], &["long-review".into()]);
+    assert_eq!(
+        coordinator.complete_batch_with_ack(&first).ack_message_ids,
+        vec!["initial"]
+    );
+
+    coordinator.reconcile_mailbox("lead-1", &["long-review".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(recovery) = coordinator.next("lead-1") else {
+        panic!("the deferred review must be delivered in full");
+    };
+    assert_eq!(recovery.redelivered_deferred_message_ids, vec!["long-review"]);
+    coordinator.observe_messages("lead-1", &recovery.batch_id, &[], &["long-review".into()]);
+    let interrupted = coordinator.interrupt_batch(&recovery, Some("replace".into()), "replacement".into());
+    assert!(interrupted.terminal_message_ids.is_empty());
+
+    coordinator.reconcile_mailbox("lead-1", &["long-review".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("interrupted full-body delivery must remain recoverable");
+    };
+    assert_eq!(retry.redelivered_deferred_message_ids, vec!["long-review"]);
+    coordinator.observe_messages("lead-1", &retry.batch_id, &[], &["long-review".into()]);
+    assert_eq!(
+        coordinator.complete_batch_with_ack(&retry).ack_message_ids,
+        vec!["long-review"]
+    );
 }
 
 #[test]

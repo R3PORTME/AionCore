@@ -1756,6 +1756,171 @@ async fn context_reset_requires_csrf() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead_conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+    let worker_conversation_id = data["assistants"][1]["conversation_id"].as_str().unwrap();
+
+    let ensure = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(ensure).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('fresh-run-message', ?, ?, 'lead-slot', 'message', 'old work', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][1]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('fresh-run-task', ?, 'Old task', 'Old issue', 'completed', ?, '[]', '[]', '{}', 10, 20)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][0]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    for (message_id, conversation_id, body) in [
+        ("fresh-run-lead-history", lead_conversation_id, "old lead issue"),
+        ("fresh-run-worker-history", worker_conversation_id, "old worker issue"),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, conversation_id, msg_id, type, content, position, status, hidden, created_at, backend_turn_id) \
+             VALUES (?, ?, ?, 'text', ?, 'left', 'finish', 0, 100, NULL)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(json!({ "content": body }).to_string())
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    }
+
+    let workspace = std::env::temp_dir().join(format!("aionui-team-fresh-run-{team_id}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace_string = workspace.to_string_lossy().to_string();
+    let fresh = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-run"),
+        json!({ "workspace": workspace_string.clone() }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(fresh).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["workspace"], workspace_string);
+    assert_eq!(body["data"]["member_count"], 2);
+
+    let team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(team.status(), StatusCode::OK);
+    let team = body_json(team).await;
+    assert_eq!(team["data"]["workspace"], workspace_string);
+
+    let fresh_lead_conversation_id = team["data"]["assistants"][0]["conversation_id"].as_str().unwrap();
+    let fresh_worker_conversation_id = team["data"]["assistants"][1]["conversation_id"].as_str().unwrap();
+    assert_ne!(fresh_lead_conversation_id, lead_conversation_id);
+    assert_ne!(fresh_worker_conversation_id, worker_conversation_id);
+
+    for (fresh_conversation_id, previous_conversation_id) in [
+        (fresh_lead_conversation_id, lead_conversation_id),
+        (fresh_worker_conversation_id, worker_conversation_id),
+    ] {
+        let extra = conversation_extra(&services, fresh_conversation_id).await;
+        assert_eq!(extra["workspace"], workspace_string);
+        assert_eq!(extra["team_issue_previous_conversation_id"], previous_conversation_id);
+    }
+
+    let old_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages \
+         WHERE id IN ('fresh-run-lead-history', 'fresh-run-worker-history') \
+           AND conversation_id IN (?, ?)",
+    )
+    .bind(lead_conversation_id)
+    .bind(worker_conversation_id)
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+    let fresh_history_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)")
+        .bind(fresh_lead_conversation_id)
+        .bind(fresh_worker_conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(old_history_count, 2, "previous Issue history must be preserved");
+    assert_eq!(fresh_history_count, 0, "new Issue conversations must start blank");
+
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(mailbox_count, 0);
+    assert_eq!(task_count, 0);
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn fresh_run_requires_authentication() {
+    let (mut app, services) = build_app().await;
+    let (_, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/nonexistent/fresh-run")
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn fresh_run_requires_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/nonexistent/fresh-run")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 async fn conversation_extra(services: &aionui_app::AppServices, conversation_id: &str) -> Value {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let owner = repo.owner_user_id(conversation_id).await.unwrap().unwrap();

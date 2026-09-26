@@ -76,6 +76,8 @@ pub struct AgentMessageQueueResult {
 pub(crate) struct AgentInboxPeek {
     pub(crate) messages: Vec<MailboxMessage>,
     pub(crate) batch_id: Option<String>,
+    /// Rows from the active batch whose full bodies were delivered in its wake.
+    pub(crate) full_body_message_ids: Vec<String>,
 }
 
 pub(crate) enum PrepareBatchResult {
@@ -377,6 +379,7 @@ impl TeamSession {
 
         match self.work_coordinator.next(slot_id) {
             ReconcileDecision::Claim(batch) => {
+                let batch = *batch;
                 let claimed_rows = match self
                     .mailbox
                     .peek_unread_by_ids(&self.team.id, slot_id, &batch.mailbox_message_ids)
@@ -2008,9 +2011,14 @@ impl TeamSession {
 
     pub(crate) async fn peek_agent_messages(&self, slot_id: &str) -> Result<AgentInboxPeek, TeamError> {
         self.scheduler.get_agent(slot_id).await?;
-        // Capture the owning batch before reading so the caller can prove a later
-        // `observe_agent_messages` still refers to the turn these rows were read in.
-        let batch_id = self.work_coordinator.active_batch_id(slot_id);
+        // Capture ownership and claimed IDs together before reading. The latter
+        // identify rows whose full bodies already reached this turn in its wake.
+        let (batch_id, full_body_message_ids) = self
+            .work_coordinator
+            .active_batch_snapshot(slot_id)
+            .map_or((None, Vec::new()), |(batch_id, message_ids)| {
+                (Some(batch_id), message_ids)
+            });
         let messages = self
             .mailbox
             .peek_unread(&self.team.id, slot_id)
@@ -2018,7 +2026,11 @@ impl TeamSession {
             .into_iter()
             .filter(|message| message.from_agent_id != slot_id)
             .collect();
-        Ok(AgentInboxPeek { messages, batch_id })
+        Ok(AgentInboxPeek {
+            messages,
+            batch_id,
+            full_body_message_ids,
+        })
     }
 
     pub(crate) async fn observe_agent_messages(
@@ -2026,11 +2038,12 @@ impl TeamSession {
         slot_id: &str,
         expected_batch_id: &str,
         message_ids: &[String],
+        truncated_message_ids: &[String],
     ) -> Result<ObserveMessagesResult, TeamError> {
         self.scheduler.get_agent(slot_id).await?;
         Ok(self
             .work_coordinator
-            .observe_messages(slot_id, expected_batch_id, message_ids))
+            .observe_messages(slot_id, expected_batch_id, message_ids, truncated_message_ids))
     }
 
     /// Tell the lead that a teammate burned through its delivery retries and is
@@ -3470,7 +3483,7 @@ mod tests {
         );
 
         let observed = session
-            .observe_agent_messages("lead-1", &batch.batch_id, &[claimed.id.clone(), queued.id.clone()])
+            .observe_agent_messages("lead-1", &batch.batch_id, &[claimed.id.clone(), queued.id.clone()], &[])
             .await
             .unwrap();
         assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
@@ -3509,15 +3522,226 @@ mod tests {
         session.stop();
     }
 
+    /// A long row that arrives after the active wake remains held back until a
+    /// later turn receives its full body; the recovery preview must then not
+    /// contradict the body already present in that wake.
+    #[tokio::test]
+    async fn truncated_unclaimed_message_survives_a_foreground_turn_for_recovery() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let short = session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                "A brief teammate update.",
+                None,
+            )
+            .await
+            .unwrap();
+        let long_content = "review-result ".repeat(400);
+
+        register_test_event_loop(&session, "lead-1");
+        let PrepareBatchResult::Execute { batch, input } = session.prepare_next_batch("lead-1").await.unwrap() else {
+            panic!("the brief teammate update must be claimed for delivery");
+        };
+        assert_eq!(batch.mailbox_message_ids, vec![short.id.clone()]);
+        assert_eq!(
+            input
+                .unread
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A brief teammate update."],
+            "the first wake carries the row claimed for that turn"
+        );
+
+        // This long row arrives after the current wake was built. The current
+        // turn has not received its full body, so the MCP preview must defer it.
+        let terminal = session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                &long_content,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Exercise the same persisted-row peek and renderer used by
+        // team_read_messages. Its preview must not make this claimed row
+        // authoritative for the current turn.
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(peek.batch_id.as_deref(), Some(batch.batch_id.as_str()));
+        let rendered = crate::mcp::server::render_inbox_page_with_wake_messages(
+            crate::mcp::server::inbox_page(peek.messages, None).expect("inbox page builds"),
+            &peek.full_body_message_ids,
+        );
+        assert_eq!(rendered.value["messages"][0]["content_truncated"], false);
+        assert_eq!(rendered.value["messages"][1]["content_truncated"], true);
+        assert!(
+            !rendered.observable_message_ids.contains(&terminal.id),
+            "a truncated preview is excluded from the MCP observation set"
+        );
+        assert_eq!(rendered.observable_message_ids, vec![short.id.clone()]);
+        assert_eq!(rendered.truncated_message_ids, vec![terminal.id.clone()]);
+        if !rendered.observable_message_ids.is_empty() || !rendered.truncated_message_ids.is_empty() {
+            session
+                .observe_agent_messages(
+                    "lead-1",
+                    &batch.batch_id,
+                    &rendered.observable_message_ids,
+                    &rendered.truncated_message_ids,
+                )
+                .await
+                .unwrap();
+        }
+
+        // A new foreground request arrives before the unread terminal result
+        // gets another delivery attempt.
+        let lease = session
+            .work_coordinator
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: "lead-1".into(),
+                role: TeamRunTargetRole::Lead,
+                source: WorkSource::UserMessage,
+                binding: CausalBinding::UserVisible,
+            })
+            .unwrap();
+        let foreground = session
+            .mailbox
+            .write(
+                "t1",
+                "lead-1",
+                "user",
+                MailboxMessageType::Message,
+                "Please check the latest status.",
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .commit_persisted_enqueue(&lease, foreground.id.clone())
+            .await
+            .unwrap();
+
+        let completion = session.work_coordinator().complete_batch_with_ack(&batch);
+        assert_eq!(completion.commit_result, CommitResult::Committed);
+        session
+            .mailbox
+            .mark_read_batch("t1", &completion.ack_message_ids)
+            .await
+            .unwrap();
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![terminal.id.clone(), foreground.id.clone()],
+            "the truncated result stays unread through successful turn completion"
+        );
+
+        let PrepareBatchResult::Execute {
+            batch: foreground_batch,
+            input: foreground_input,
+        } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("the foreground request must be delivered first");
+        };
+        assert_eq!(foreground_batch.mailbox_message_ids, vec![foreground.id.clone()]);
+        assert_eq!(foreground_input.unread[0].content, "Please check the latest status.");
+        assert!(
+            unread_ids(&session, "lead-1").await.contains(&terminal.id),
+            "the original full result remains available while foreground work runs"
+        );
+        let foreground_completion = session.work_coordinator().complete_batch_with_ack(&foreground_batch);
+        assert_eq!(foreground_completion.commit_result, CommitResult::Committed);
+        session
+            .mailbox
+            .mark_read_batch("t1", &foreground_completion.ack_message_ids)
+            .await
+            .unwrap();
+
+        let PrepareBatchResult::Execute {
+            batch: recovery_batch,
+            input: recovery_input,
+        } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("the complete terminal result must be claimable on the later turn");
+        };
+        assert_eq!(recovery_batch.mailbox_message_ids, vec![terminal.id.clone()]);
+        assert_eq!(recovery_input.unread[0].content, long_content);
+
+        // The recovery turn invokes team_read_messages again. The API still
+        // returns a bounded preview, even though the same full row was already
+        // supplied in this turn's wake payload.
+        let recovery_peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(
+            recovery_peek.batch_id.as_deref(),
+            Some(recovery_batch.batch_id.as_str())
+        );
+        let recovery_rendered = crate::mcp::server::render_inbox_page_with_wake_messages(
+            crate::mcp::server::inbox_page(recovery_peek.messages, None).expect("inbox page builds"),
+            &recovery_peek.full_body_message_ids,
+        );
+        assert_eq!(recovery_rendered.truncated_message_ids, vec![terminal.id.clone()]);
+        assert_eq!(recovery_rendered.value["messages"][0]["content_truncated"], true);
+        assert_eq!(recovery_rendered.value["messages"][0]["full_body_in_wake"], true);
+        let recovery_note = recovery_rendered.value["messages"][0]["note"].as_str().unwrap();
+        assert!(recovery_note.contains("full message body was delivered in this turn's wake"));
+        assert!(!recovery_note.contains("will be redelivered in full on a later turn"));
+        assert!(!recovery_note.contains("do not act on this preview alone"));
+        session
+            .observe_agent_messages(
+                "lead-1",
+                &recovery_batch.batch_id,
+                &recovery_rendered.observable_message_ids,
+                &recovery_rendered.truncated_message_ids,
+            )
+            .await
+            .unwrap();
+
+        let recovery_completion = session.work_coordinator().complete_batch_with_ack(&recovery_batch);
+        assert_eq!(
+            recovery_completion.ack_message_ids,
+            vec![recovery_batch.mailbox_message_ids[0].clone()]
+        );
+        assert!(
+            recovery_completion.ack_message_ids.contains(&terminal.id),
+            "despite the hold-back instruction, this successful turn acknowledges the row"
+        );
+        session
+            .mailbox
+            .mark_read_batch("t1", &recovery_completion.ack_message_ids)
+            .await
+            .unwrap();
+        assert!(unread_ids(&session, "lead-1").await.is_empty());
+        assert!(matches!(
+            session.prepare_next_batch("lead-1").await.unwrap(),
+            PrepareBatchResult::Quiescent
+        ));
+        session.stop();
+    }
+
     /// P4: the failure half of the same contract — a turn that does not succeed
     /// leaves every observed row unread so the normal delivery path retries it.
     #[tokio::test]
     async fn observed_messages_stay_unread_when_the_turn_fails() {
         let (session, _repo) = start_session_with(empty_task_manager()).await;
         let session = Arc::new(session);
+        let long_content = "failed-review-result ".repeat(300);
         let claimed = session
             .mailbox
-            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .write(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                &long_content,
+                None,
+            )
             .await
             .unwrap();
         let batch = claim_active_batch(&session, "lead-1").await;
@@ -3527,9 +3751,19 @@ mod tests {
             .await
             .unwrap();
 
-        session.peek_agent_messages("lead-1").await.unwrap();
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        let rendered = crate::mcp::server::render_inbox_page_with_wake_messages(
+            crate::mcp::server::inbox_page(peek.messages, None).expect("inbox page builds"),
+            &peek.full_body_message_ids,
+        );
+        assert_eq!(rendered.truncated_message_ids, vec![claimed.id.clone()]);
         session
-            .observe_agent_messages("lead-1", &batch.batch_id, std::slice::from_ref(&queued.id))
+            .observe_agent_messages(
+                "lead-1",
+                &batch.batch_id,
+                &rendered.observable_message_ids,
+                &rendered.truncated_message_ids,
+            )
             .await
             .unwrap();
 
@@ -3545,11 +3779,82 @@ mod tests {
             "a failed turn acknowledges nothing"
         );
 
-        let PrepareBatchResult::Execute { batch: retry, .. } = session.prepare_next_batch("lead-1").await.unwrap()
+        let PrepareBatchResult::Execute {
+            batch: retry_batch,
+            input: retry_input,
+        } = session.prepare_next_batch("lead-1").await.unwrap()
         else {
             panic!("both rows must remain claimable after the failed turn");
         };
-        assert_eq!(retry.mailbox_message_ids, vec![claimed.id, queued.id]);
+        assert_eq!(
+            retry_batch.mailbox_message_ids,
+            vec![claimed.id.clone(), queued.id.clone()]
+        );
+        assert_eq!(retry_input.unread[0].content, long_content);
+
+        let retry_peek = session.peek_agent_messages("lead-1").await.unwrap();
+        let retry_rendered = crate::mcp::server::render_inbox_page_with_wake_messages(
+            crate::mcp::server::inbox_page(retry_peek.messages, None).expect("inbox page builds"),
+            &retry_peek.full_body_message_ids,
+        );
+        assert_eq!(retry_rendered.truncated_message_ids, vec![claimed.id.clone()]);
+        session
+            .observe_agent_messages(
+                "lead-1",
+                &retry_batch.batch_id,
+                &retry_rendered.observable_message_ids,
+                &retry_rendered.truncated_message_ids,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .work_coordinator()
+                .fail_batch(&retry_batch, "turn_failed")
+                .commit_result,
+            CommitResult::Committed
+        );
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "a failed redelivery remains unread"
+        );
+
+        let PrepareBatchResult::Execute {
+            batch: successful_retry,
+            input: successful_input,
+        } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("the failed redelivery must remain claimable");
+        };
+        assert_eq!(
+            successful_retry.mailbox_message_ids,
+            vec![claimed.id.clone(), queued.id.clone()]
+        );
+        assert_eq!(successful_input.unread[0].content, long_content);
+        let final_peek = session.peek_agent_messages("lead-1").await.unwrap();
+        let final_rendered = crate::mcp::server::render_inbox_page_with_wake_messages(
+            crate::mcp::server::inbox_page(final_peek.messages, None).expect("inbox page builds"),
+            &final_peek.full_body_message_ids,
+        );
+        assert_eq!(final_rendered.truncated_message_ids, vec![claimed.id.clone()]);
+        session
+            .observe_agent_messages(
+                "lead-1",
+                &successful_retry.batch_id,
+                &final_rendered.observable_message_ids,
+                &final_rendered.truncated_message_ids,
+            )
+            .await
+            .unwrap();
+        let completion = session.work_coordinator().complete_batch_with_ack(&successful_retry);
+        assert_eq!(completion.ack_message_ids, vec![claimed.id.clone(), queued.id.clone()]);
+        session
+            .mailbox
+            .mark_read_batch("t1", &completion.ack_message_ids)
+            .await
+            .unwrap();
+        assert!(unread_ids(&session, "lead-1").await.is_empty());
         session.stop();
     }
 
@@ -3586,7 +3891,7 @@ mod tests {
         assert_ne!(first.batch_id, second.batch_id);
 
         let observed = session
-            .observe_agent_messages("lead-1", &first.batch_id, std::slice::from_ref(&queued.id))
+            .observe_agent_messages("lead-1", &first.batch_id, &[], std::slice::from_ref(&queued.id))
             .await
             .unwrap();
         assert_eq!(observed.batch_id, None, "the stale observation is rejected");

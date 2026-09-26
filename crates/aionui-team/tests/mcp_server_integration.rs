@@ -203,10 +203,19 @@ fn is_error_response(resp: &Value) -> bool {
     resp["result"]["isError"].as_bool().unwrap_or(false)
 }
 
+fn owner_name(owner: &str) -> &'static str {
+    match owner {
+        "lead-1" => "Leader",
+        "worker-1" => "Worker",
+        other => panic!("test owner {other} has no matching roster entry"),
+    }
+}
+
 async fn create_task(stream: &mut TcpStream, id: u64, subject: &str, owner: Option<&str>) -> String {
     let mut args = json!({ "subject": subject });
     if let Some(owner) = owner {
         args["owner"] = json!(owner);
+        args["owner_name"] = json!(owner_name(owner));
     }
     let resp = call_tool(stream, id, "team_task_create", args).await;
     assert!(!is_error_response(&resp), "team_task_create failed: {resp}");
@@ -699,6 +708,33 @@ async fn ttc1_create_basic_task() {
 }
 
 #[tokio::test]
+async fn ttc_owner_identity_mismatch_fails_closed() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_task_create",
+        json!({
+            "subject": "Review candidate",
+            "owner": "worker-1",
+            "owner_name": "Claude Code"
+        }),
+    )
+    .await;
+
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(text.contains("does not match"));
+    let list_resp = call_tool(&mut stream, 3, "team_task_list", json!({})).await;
+    let tasks: Vec<Value> = serde_json::from_str(&extract_text(&list_resp)).unwrap();
+    assert!(tasks.is_empty(), "mismatched owner identity must not create a task");
+
+    env.server.stop();
+}
+
+#[tokio::test]
 async fn ttc2_create_task_with_dependency() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
@@ -770,7 +806,7 @@ async fn ttl3_task_list_empty_args_still_returns_full_board() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
     let keep_id = create_task(&mut stream, 2, "Keep", Some("worker-1")).await;
-    let deleted_id = create_task(&mut stream, 3, "Deleted", Some("worker-2")).await;
+    let deleted_id = create_task(&mut stream, 3, "Deleted", Some("lead-1")).await;
     update_task_status(&mut stream, 4, &deleted_id, "deleted").await;
 
     let tasks = list_tasks_with_args(&mut stream, 5, json!({})).await;

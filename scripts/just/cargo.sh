@@ -59,6 +59,13 @@ PY
 }
 
 if [[ -n "${AIONRS:-}" ]]; then
+    for arg in "$@"; do
+        if [[ "$arg" == "--locked" ]]; then
+            echo "AIONRS cannot be used with --locked publication checks because resolving a local SDK patch may change Cargo.lock. Unset AIONRS and rerun just push; use just lint/test for local SDK development." >&2
+            exit 1
+        fi
+    done
+
     if [[ ! -d "$AIONRS" ]]; then
         echo "AIONRS does not exist or is not a directory: $AIONRS" >&2
         exit 1

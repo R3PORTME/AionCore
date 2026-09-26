@@ -169,6 +169,7 @@ struct SpawnAgentParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TaskCreateParams {
     /// Task subject.
     subject: String,
@@ -178,12 +179,16 @@ struct TaskCreateParams {
     /// Owning agent slot_id.
     #[serde(default)]
     owner: Option<String>,
+    /// Current display name from team_members; must match the owner slot_id.
+    #[serde(default)]
+    owner_name: Option<String>,
     /// Task IDs this task depends on.
     #[serde(default)]
     blocked_by: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TaskUpdateParams {
     /// Task ID to update.
     task_id: String,
@@ -196,6 +201,9 @@ struct TaskUpdateParams {
     /// New owning agent slot_id.
     #[serde(default)]
     owner: Option<String>,
+    /// Current display name from team_members; must match the owner slot_id.
+    #[serde(default)]
+    owner_name: Option<String>,
     /// New dependency list.
     #[serde(default)]
     blocked_by: Option<Vec<String>>,
@@ -287,7 +295,7 @@ struct DescribeAssistantParams {
 impl TeamStdioServer {
     #[tool(
         name = "team_read_messages",
-        description = "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet."
+        description = "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. Do not use this tool as a wait/poll primitive: repeated reads in the same turn may return the same rows because acknowledgement is committed only when the turn completes successfully. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet."
     )]
     async fn read_messages(&self, Parameters(params): Parameters<ReadMessagesParams>) -> CallToolResult {
         let mut arguments = serde_json::Map::new();
@@ -346,7 +354,10 @@ impl TeamStdioServer {
         .await
     }
 
-    #[tool(name = "team_task_create", description = "Create a new task on the team task board.")]
+    #[tool(
+        name = "team_task_create",
+        description = "Create a new task on the team task board. When assigning an owner, provide both owner (the exact slot_id) and owner_name (the current display name from team_members). The backend rejects missing or mismatched identity pairs instead of silently assigning the wrong teammate."
+    )]
     async fn task_create(&self, Parameters(params): Parameters<TaskCreateParams>) -> CallToolResult {
         self.forward_to_tcp(
             "team_task_create",
@@ -354,6 +365,7 @@ impl TeamStdioServer {
                 "subject": params.subject,
                 "description": params.description,
                 "owner": params.owner,
+                "owner_name": params.owner_name,
                 "blocked_by": params.blocked_by,
             }),
         )
@@ -362,7 +374,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_task_update",
-        description = "Update an existing task on the team task board."
+        description = "Update an existing task on the team task board. When changing owner, provide both owner (the exact slot_id) and owner_name (the current display name from team_members); mismatched pairs are rejected."
     )]
     async fn task_update(&self, Parameters(params): Parameters<TaskUpdateParams>) -> CallToolResult {
         self.forward_to_tcp(
@@ -372,6 +384,7 @@ impl TeamStdioServer {
                 "status": params.status,
                 "description": params.description,
                 "owner": params.owner,
+                "owner_name": params.owner_name,
                 "blocked_by": params.blocked_by,
             }),
         )
@@ -853,6 +866,42 @@ mod tests {
     }
 
     #[test]
+    fn team_stdio_task_assignment_schemas_expose_owner_identity_checksum() {
+        let router = TeamStdioServer::tool_router();
+        let tools = router.list_all();
+
+        for name in ["team_task_create", "team_task_update"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} tool missing"));
+            let properties = tool.input_schema["properties"].as_object().expect("tool properties");
+            assert!(properties.contains_key("owner"));
+            assert!(
+                properties.contains_key("owner_name"),
+                "{name} schema must expose owner_name"
+            );
+        }
+    }
+
+    #[test]
+    fn task_assignment_params_reject_unknown_fields() {
+        let create = serde_json::from_value::<TaskCreateParams>(json!({
+            "subject": "Task",
+            "owner_name": "Claude Code",
+            "unexpected": true
+        }));
+        assert!(matches!(create, Err(error) if error.to_string().contains("unknown field")));
+
+        let update = serde_json::from_value::<TaskUpdateParams>(json!({
+            "task_id": "task-1",
+            "owner_name": "Claude Code",
+            "unexpected": true
+        }));
+        assert!(matches!(update, Err(error) if error.to_string().contains("unknown field")));
+    }
+
+    #[test]
     fn team_stdio_router_exposes_team_list_assistants() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
@@ -1122,6 +1171,106 @@ mod tests {
         accept_task.await.unwrap();
         assert_eq!(result.is_error, Some(false));
         assert_eq!(first_text(&result), "ok");
+    }
+
+    #[tokio::test]
+    async fn task_create_forwards_owner_name() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _init = read_frame(&mut socket).await.unwrap();
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let call = read_frame(&mut socket).await.unwrap();
+            let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            assert_eq!(call_value["params"]["name"], json!("team_task_create"));
+            let arguments = &call_value["params"]["arguments"];
+            assert_eq!(arguments["subject"], json!("Task"));
+            assert_eq!(arguments["owner"], json!("worker-1"));
+            assert_eq!(arguments["owner_name"], json!("Claude Code"));
+
+            let response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "content": [{ "type": "text", "text": "created" }] }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "dummy-slot".into(),
+        };
+        let params = serde_json::from_value::<TaskCreateParams>(json!({
+            "subject": "Task",
+            "owner": "worker-1",
+            "owner_name": "Claude Code"
+        }))
+        .expect("task create params");
+
+        let result = server.task_create(Parameters(params)).await;
+
+        accept_task.await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "created");
+    }
+
+    #[tokio::test]
+    async fn task_update_forwards_owner_name() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _init = read_frame(&mut socket).await.unwrap();
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let call = read_frame(&mut socket).await.unwrap();
+            let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            assert_eq!(call_value["params"]["name"], json!("team_task_update"));
+            let arguments = &call_value["params"]["arguments"];
+            assert_eq!(arguments["task_id"], json!("task-1"));
+            assert_eq!(arguments["owner"], json!("worker-1"));
+            assert_eq!(arguments["owner_name"], json!("Claude Code"));
+
+            let response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "content": [{ "type": "text", "text": "updated" }] }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "dummy-slot".into(),
+        };
+        let params = serde_json::from_value::<TaskUpdateParams>(json!({
+            "task_id": "task-1",
+            "owner": "worker-1",
+            "owner_name": "Claude Code"
+        }))
+        .expect("task update params");
+
+        let result = server.task_update(Parameters(params)).await;
+
+        accept_task.await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "updated");
     }
 
     #[tokio::test]

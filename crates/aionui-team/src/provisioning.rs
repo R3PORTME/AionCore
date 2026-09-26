@@ -138,6 +138,17 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         Ok(false)
     }
 
+    async fn create_fresh_conversation_generation(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _workspace: &str,
+    ) -> Result<String, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "fresh Team conversation generation is unavailable".to_owned(),
+        ))
+    }
+
     async fn warmup_agent_process(
         &self,
         user_id: &str,

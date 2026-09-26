@@ -175,6 +175,16 @@ pub(crate) struct WorkBatch {
     /// turn completes successfully; failed or cancelled turns leave them
     /// unread for the normal recovery path.
     pub(crate) observed_message_ids: Vec<String>,
+    /// Rows rendered only as truncated previews whose full bodies have not
+    /// reached this turn in its wake. They stay unread on successful completion.
+    pub(crate) deferred_message_ids: Vec<String>,
+    /// Claimed rows whose MCP preview was truncated. They remain unread when a
+    /// turn is interrupted, even though their full bodies were in its wake.
+    pub(crate) preview_truncated_message_ids: Vec<String>,
+    /// Rows deferred by an earlier turn and delivered again in this batch's
+    /// full wake payload. A successful turn can acknowledge these even if its
+    /// `team_read_messages` call sees only the same bounded preview again.
+    pub(crate) redelivered_deferred_message_ids: Vec<String>,
     pub(crate) highest_priority: WorkPriority,
     pub(crate) team_run_ids: Vec<String>,
     pub(crate) operation_id: u64,
@@ -188,7 +198,7 @@ pub(crate) struct WorkBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReconcileDecision {
-    Claim(WorkBatch),
+    Claim(Box<WorkBatch>),
     WaitingForCompletion,
     Blocked(RuntimeConstraint),
     SettleSignals(Vec<String>),
