@@ -1003,6 +1003,7 @@ fn agent_json(agent: &TeamAgent) -> Value {
         "slot_id": agent.slot_id,
         "name": agent.name,
         "role": agent.role,
+        "routing": agent.routing,
         "status": status,
         "assistant_id": agent.assistant_id,
         "model": agent.model,
@@ -1119,6 +1120,7 @@ async fn exec_spawn_agent(
     let req = SpawnAgentRequest {
         name: requested_name.clone(),
         assistant_id: Some(assistant_id),
+        routing: input.routing,
     };
 
     let service = service
@@ -1683,6 +1685,7 @@ mod tests {
             slot_id: slot_id.to_owned(),
             name: name.to_owned(),
             role: TeammateRole::Teammate,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: format!("conversation-{slot_id}"),
             backend: "acp".into(),
             model: "test-model".into(),

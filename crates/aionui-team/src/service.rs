@@ -3673,6 +3673,7 @@ mod tests {
                 aionui_api_types::TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3681,6 +3682,7 @@ mod tests {
                 aionui_api_types::TeamAgentInput {
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3696,6 +3698,7 @@ mod tests {
         request.agents.push(aionui_api_types::TeamAgentInput {
             name: "Butler".into(),
             role: "teammate".into(),
+            routing: None,
             backend: Some("aionrs".into()),
             model: "claude-sonnet".into(),
             assistant_id: None,
@@ -4829,6 +4832,7 @@ mod tests {
                 AddAgentRequest {
                     name: "Worker".to_owned(),
                     role: "teammate".to_owned(),
+                    routing: None,
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
                     assistant_id: None,
@@ -4904,6 +4908,7 @@ mod tests {
             AddAgentRequest {
                 name: "Worker".to_owned(),
                 role: "teammate".to_owned(),
+                routing: None,
                 backend: Some("acp".to_owned()),
                 model: "claude".to_owned(),
                 assistant_id: None,
@@ -4947,6 +4952,7 @@ mod tests {
                 AddAgentRequest {
                     name: "Worker".to_owned(),
                     role: "teammate".to_owned(),
+                    routing: None,
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
                     assistant_id: None,

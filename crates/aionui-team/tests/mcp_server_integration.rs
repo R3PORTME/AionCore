@@ -42,6 +42,7 @@ fn make_agents() -> Vec<TeamAgent> {
             slot_id: "lead-1".into(),
             name: "Leader".into(),
             role: TeammateRole::Lead,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "conv-lead".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -54,6 +55,7 @@ fn make_agents() -> Vec<TeamAgent> {
             slot_id: "worker-1".into(),
             name: "Worker".into(),
             role: TeammateRole::Teammate,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "conv-worker".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -63,6 +65,23 @@ fn make_agents() -> Vec<TeamAgent> {
             cli_path: None,
         },
     ]
+}
+
+fn make_routing_agents() -> Vec<TeamAgent> {
+    let mut agents = make_agents();
+    agents[0].routing = aionui_api_types::TeamRouting::Coordinator;
+    agents[1].routing = aionui_api_types::TeamRouting::ImplementationEscalation;
+    let mut primary = agents[1].clone();
+    primary.slot_id = "primary-slot".into();
+    primary.name = "Opaque A".into();
+    primary.routing = aionui_api_types::TeamRouting::ImplementationPrimary;
+    let mut reviewer = agents[1].clone();
+    reviewer.slot_id = "review-slot".into();
+    reviewer.name = "Opaque B".into();
+    reviewer.routing = aionui_api_types::TeamRouting::IndependentReview;
+    agents.push(primary);
+    agents.push(reviewer);
+    agents
 }
 
 struct TestEnv {
@@ -75,12 +94,15 @@ async fn setup() -> TestEnv {
 }
 
 async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> TestEnv {
+    setup_with_agents(make_agents(), prompt_dump).await
+}
+
+async fn setup_with_agents(agents: Vec<TeamAgent>, prompt_dump: Option<TeamPromptDumpConfig>) -> TestEnv {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo.clone()));
     let recorder = Arc::new(RecordingBroadcaster::new());
     let broadcaster: Arc<dyn EventBroadcaster> = recorder.clone();
-    let agents = make_agents();
     let scheduler = Arc::new(TeammateManager::new(
         "team-1".into(),
         "user-1".into(),
@@ -1026,6 +1048,77 @@ async fn tm1_list_all_members() {
         );
     }
 
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn team_members_exposes_primary_escalation_and_review_independent_of_identity() {
+    let env = setup_with_agents(make_routing_agents(), None).await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    let response = call_tool(&mut stream, 2, "team_members", json!({})).await;
+    assert!(!is_error_response(&response));
+    let members: Vec<Value> = serde_json::from_str(&extract_text(&response)).unwrap();
+    assert_eq!(members.len(), 4);
+    for (slot, expected) in [
+        ("lead-1", "coordinator"),
+        ("worker-1", "implementation_escalation"),
+        ("primary-slot", "implementation_primary"),
+        ("review-slot", "independent_review"),
+    ] {
+        let member = members.iter().find(|member| member["slot_id"] == slot).unwrap();
+        assert_eq!(member["routing"], expected);
+    }
+    assert!(members.iter().all(|member| member["status"] == "idle"));
+    let primary = members
+        .iter()
+        .find(|member| member["routing"] == "implementation_primary")
+        .unwrap();
+    let assigned = call_tool(
+        &mut stream,
+        3,
+        "team_task_create",
+        json!({"subject": "Change one bounded file", "owner": primary["slot_id"], "owner_name": primary["name"]}),
+    )
+    .await;
+    assert!(!is_error_response(&assigned));
+    let task: Value = serde_json::from_str(&extract_text(&assigned)).unwrap();
+    assert_eq!(task["task"]["owner"], "primary-slot");
+    let listed = call_tool(&mut stream, 4, "team_task_list", json!({})).await;
+    assert!(!is_error_response(&listed));
+    let tasks: Value = serde_json::from_str(&extract_text(&listed)).unwrap();
+    assert_eq!(tasks.as_array().unwrap().len(), 1);
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn escalation_lane_accepts_one_hard_coding_assignment_with_primary_available() {
+    let env = setup_with_agents(make_routing_agents(), None).await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    let roster = call_tool(&mut stream, 2, "team_members", json!({})).await;
+    assert!(!is_error_response(&roster));
+    let members: Vec<Value> = serde_json::from_str(&extract_text(&roster)).unwrap();
+    assert!(
+        members
+            .iter()
+            .any(|member| member["routing"] == "implementation_primary")
+    );
+    let escalation = members
+        .iter()
+        .find(|member| member["routing"] == "implementation_escalation")
+        .unwrap();
+    let assigned = call_tool(
+        &mut stream,
+        3,
+        "team_task_create",
+        json!({"subject": "Diagnose cross-cutting lifecycle failure", "owner": escalation["slot_id"], "owner_name": escalation["name"]}),
+    )
+    .await;
+    assert!(!is_error_response(&assigned));
+    let task: Value = serde_json::from_str(&extract_text(&assigned)).unwrap();
+    assert_eq!(task["task"]["owner"], "worker-1");
+    let listed = call_tool(&mut stream, 4, "team_task_list", json!({})).await;
+    let tasks: Vec<Value> = serde_json::from_str(&extract_text(&listed)).unwrap();
+    assert_eq!(tasks.len(), 1);
     env.server.stop();
 }
 

@@ -1056,6 +1056,7 @@ mod tests {
                 aionui_api_types::AddAgentRequest {
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: None,
                     model: "gpt-5-mini".into(),
                     assistant_id: Some("word-creator".into()),
@@ -1108,6 +1109,7 @@ mod tests {
                 backend: "acp".into(),
                 model: "claude".into(),
                 assistant_id: None,
+                routing: aionui_api_types::TeamRouting::Unassigned,
             })
             .await
             .unwrap();

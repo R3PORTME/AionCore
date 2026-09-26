@@ -166,6 +166,9 @@ struct SpawnAgentParams {
     /// Assistant identifier from the available assistants catalog.
     #[serde(default)]
     assistant_id: Option<String>,
+    /// Routing responsibility: implementation_primary, implementation_escalation, independent_review, or unassigned.
+    #[serde(default)]
+    routing: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -349,6 +352,7 @@ impl TeamStdioServer {
             &serde_json::json!({
                 "name": params.name,
                 "assistant_id": params.assistant_id,
+                "routing": params.routing,
             }),
         )
         .await
@@ -1119,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_forwards_only_assistant_first_arguments() {
+    async fn spawn_agent_forwards_assistant_binding_and_routing() {
         let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept_task = tokio::spawn(async move {
@@ -1139,6 +1143,7 @@ mod tests {
             let arguments = &call_value["params"]["arguments"];
             assert_eq!(arguments["name"], json!("CodexCLI"));
             assert_eq!(arguments["assistant_id"], json!("bare:8e1acf31"));
+            assert_eq!(arguments["routing"], json!("implementation_primary"));
             assert!(arguments.get("model").is_none());
             assert!(arguments.get("role").is_none());
             assert!(arguments.get("agent_type").is_none());
@@ -1165,6 +1170,7 @@ mod tests {
             .spawn_agent(Parameters(SpawnAgentParams {
                 name: "CodexCLI".into(),
                 assistant_id: Some("bare:8e1acf31".into()),
+                routing: Some("implementation_primary".into()),
             }))
             .await;
 

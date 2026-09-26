@@ -42,6 +42,45 @@ async fn team_capabilities_prints_contract_without_runtime_env() {
         .unwrap();
     assert_eq!(spawn["lead_only"], true);
     assert!(spawn["stdin_json_schema"]["properties"]["assistant_id"].is_object());
+    assert_eq!(
+        spawn["stdin_json_schema"]["properties"]["routing"]["enum"],
+        serde_json::json!([
+            "implementation_primary",
+            "implementation_escalation",
+            "independent_review",
+            "unassigned"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn team_cli_spawn_forwards_structured_routing() {
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    let app = Router::new().route(
+        "/api/runtime/team-tools/call",
+        post(|Json(request): Json<Value>| async move { Json(json!({"success": true, "data": request})) }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let output = run_team_call(
+        &base_url,
+        &["spawn-agent"],
+        r#"{"name":"Builder","assistant_id":"assistant-1","routing":"implementation_primary"}"#,
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["data"]["tool"], "team_spawn_agent");
+    assert_eq!(response["data"]["arguments"]["routing"], "implementation_primary");
+    server.abort();
 }
 
 #[tokio::test]

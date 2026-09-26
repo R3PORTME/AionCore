@@ -94,6 +94,7 @@ pub(crate) enum PrepareBatchResult {
 pub struct SpawnAgentRequest {
     pub name: String,
     pub assistant_id: Option<String>,
+    pub routing: Option<aionui_api_types::TeamRouting>,
 }
 
 pub struct TeamSession {
@@ -1877,6 +1878,11 @@ impl TeamSession {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| TeamError::InvalidRequest("spawn_agent.assistant_id is required".into()))?;
+        if req.routing == Some(aionui_api_types::TeamRouting::Coordinator) {
+            return Err(TeamError::InvalidRequest(
+                "coordinator routing requires lead role".into(),
+            ));
+        }
 
         let service = self
             .service
@@ -1909,6 +1915,7 @@ impl TeamSession {
                 backend,
                 model,
                 assistant_id: Some(assistant_id.to_owned()),
+                routing: req.routing.unwrap_or_default(),
             })
             .await?;
 
@@ -2745,6 +2752,7 @@ mod tests {
                     slot_id: "lead-1".into(),
                     name: "Lead".into(),
                     role: TeammateRole::Lead,
+                    routing: aionui_api_types::TeamRouting::Unassigned,
                     conversation_id: "c1".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
@@ -2757,6 +2765,7 @@ mod tests {
                     slot_id: "worker-1".into(),
                     name: "Worker".into(),
                     role: TeammateRole::Teammate,
+                    routing: aionui_api_types::TeamRouting::Unassigned,
                     conversation_id: "c2".into(),
                     backend: "acp".into(),
                     model: "claude".into(),
@@ -2967,6 +2976,7 @@ mod tests {
             slot_id: "new-1".into(),
             name: "NewAgent".into(),
             role: TeammateRole::Teammate,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "c3".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -3091,6 +3101,7 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             assistant_id: Some("word-creator".into()),
+            routing: None,
         }
     }
 
@@ -4643,6 +4654,7 @@ mod tests {
         SpawnAgentRequest {
             name: "Helper".into(),
             assistant_id: assistant_id.map(str::to_owned),
+            routing: None,
         }
     }
 

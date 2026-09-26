@@ -511,7 +511,8 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." },
+                    "routing": { "type": "string", "enum": ["implementation_primary", "implementation_escalation", "independent_review", "unassigned"], "description": "Provider-neutral responsibility for the new teammate." }
                 },
                 "required": ["name", "assistant_id"]
             }),

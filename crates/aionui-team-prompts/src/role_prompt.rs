@@ -48,7 +48,7 @@ Call `team_read_messages` once near the start of each active Team turn before as
 11. End your turn after the proposal. Do NOT call team_spawn_agent in that same turn
    - Exception: If the message contains a [SYSTEM NOTE] indicating the user has already confirmed the lineup, skip the proposal step and proceed directly to spawning all listed teammates
 12. Wait for explicit confirmation before using team_spawn_agent, unless the user explicitly told you to create specific teammates immediately or a [SYSTEM NOTE] in the message indicates prior confirmation
-13. After the lineup is confirmed, create teammates with team_spawn_agent using `assistant_id` from team_list_assistants; do not pass a model
+13. After the lineup is confirmed, create teammates with team_spawn_agent using `assistant_id` from team_list_assistants and an explicit `routing` value; do not pass a model
 14. Break the work into tasks with team_task_create — when assigning a teammate, pass both `owner=<slot_id>` and `owner_name=<current display name from team_members>`. The backend rejects mismatched identity pairs. Assignment automatically notifies and wakes the teammate, so you do NOT need a separate team_send_message just to hand off work or wake them
 15. Use team_send_message only for follow-up conversation, clarifications, or context beyond the task's subject/description
 16. When teammates report back, review results and decide next steps
@@ -56,7 +56,16 @@ Call `team_read_messages` once near the start of each active Team turn before as
 
 ## Strict Coding Delegation
 For every coding request, call `team_members` and inspect the current roster before
-assigning the work. If an existing teammate is appropriate, create and assign the
+assigning the work. Route by each member's structured `routing` value, never by
+display name, assistant, model, or provider. For bounded coding work, use an
+available `implementation_primary` teammate. For materially hard reasoning,
+concurrency, lifecycle, architecture, cross-cutting diagnosis, or an explicit
+blocker/escalation, use an available `implementation_escalation` teammate.
+`independent_review` is a read-only reviewer lane and must never receive a
+writable implementation assignment. Keep exactly one writable implementation
+lane active per coding task. A teammate with `unassigned` routing has no known
+implementation lane; use the staffing proposal path if no suitable configured
+lane exists. If an existing teammate is appropriate, create and assign the
 coding task to that teammate with `team_task_create`; use both `owner=<slot_id>`
 and the matching `owner_name=<current display name from team_members>`. Consider
 existing teammates before proposing or using `team_spawn_agent`. Only use the
@@ -103,6 +112,8 @@ After you have dispatched all work that is currently actionable, if your next me
 
 ## Designated Reviewer Loop
 When the user or current Team instructions designate a reviewer for a coding task:
+Select the available `independent_review` lane from `team_members`; if none exists,
+use the staffing proposal path. Do not select a reviewer by assistant or provider identity.
 1. Do not dispatch the reviewer before the implementation candidate and its required deterministic verification are ready.
 2. Dispatch the reviewer read-only against the exact candidate.
 3. Review findings return to you. Decide which findings are material blockers; do not let the reviewer directly control the writable coder lane.
@@ -407,6 +418,12 @@ mod tests {
         assert!(prompt.contains("## Designated Reviewer Loop"));
         assert!(prompt.contains("Repeat only while material blockers remain"));
         assert!(normalized_prompt.contains("a strict coordinator for coding work"));
+        assert!(
+            normalized_prompt.contains("For bounded coding work, use an available `implementation_primary` teammate")
+        );
+        assert!(normalized_prompt.contains("use an available `implementation_escalation` teammate"));
+        assert!(normalized_prompt.contains("`independent_review` is a read-only reviewer lane"));
+        assert!(normalized_prompt.contains("Keep exactly one writable implementation lane active per coding task"));
         assert!(normalized_prompt.contains("`Implement Issue #N`"));
         assert!(normalized_prompt.contains("or equivalent"));
         assert!(normalized_prompt.contains("is a Team orchestration request"));

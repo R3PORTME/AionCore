@@ -79,6 +79,8 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     #[serde(alias = "assistantId")]
     pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub routing: Option<aionui_api_types::TeamRouting>,
 }
 
 #[derive(Debug, Deserialize)]
