@@ -136,3 +136,204 @@ async fn unknown_team_command_returns_json_error_envelope() {
     assert_eq!(stdout["error"]["code"], "unknown_tool");
     assert_eq!(stdout["meta"]["command"], "team does-not-exist");
 }
+
+async fn run_team_call(base_url: &str, args: &[&str], input: &str) -> std::process::Output {
+    let mut child = team_command()
+        .args(args)
+        .env("AIONUI_BASE_URL", base_url)
+        .env("AIONUI_USER_ID", "user-1")
+        .env("AIONUI_CONVERSATION_ID", "conv-1")
+        .env("AIONUI_RUNTIME_TOKEN", "token-1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(input.as_bytes()).await.unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().await.unwrap()
+}
+
+#[tokio::test]
+async fn repeated_team_cli_calls_reach_the_same_runtime_bridge() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = received.clone();
+    let app = Router::new().route(
+        "/api/runtime/team-tools/call",
+        post(move |Json(request): Json<Value>| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Json(json!({ "success": true, "data": { "tool": request["tool"] } }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let calls = [
+        (&["members"][..], "{}", "team_members"),
+        (&["read-messages"][..], "{}", "team_read_messages"),
+        (&["task", "list"][..], "{}", "team_task_list"),
+        (
+            &["task", "update"][..],
+            r#"{"task_id":"task-1","status":"completed"}"#,
+            "team_task_update",
+        ),
+        (
+            &["send-message"][..],
+            r#"{"to":"lead-1","message":"done"}"#,
+            "team_send_message",
+        ),
+    ];
+    for _ in 0..4 {
+        for (args, input, tool) in calls {
+            let output = run_team_call(&base_url, args, input).await;
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(envelope["success"], true);
+            assert_eq!(envelope["data"]["tool"], tool);
+        }
+    }
+    assert_eq!(received.load(Ordering::SeqCst), 20);
+    server.abort();
+}
+
+#[tokio::test]
+async fn team_cli_retries_connect_failure_then_reports_success_only_after_receipt() {
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let server = tokio::spawn(async move {
+        sleep(Duration::from_millis(160)).await;
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let app = Router::new().route(
+            "/api/runtime/team-tools/call",
+            post(|| async { Json(json!({ "success": true, "data": { "members": [] } })) }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let output = run_team_call(&format!("http://{addr}"), &["members"], "{}").await;
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["success"], true);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unavailable_bridge_never_claims_task_completion_or_report_delivery() {
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    for (args, input) in [
+        (&["task", "update"][..], r#"{"task_id":"task-1","status":"completed"}"#),
+        (&["send-message"][..], r#"{"to":"lead-1","message":"done"}"#),
+    ] {
+        let output = run_team_call(&base_url, args, input).await;
+        assert_eq!(output.status.code(), Some(2));
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["success"], false);
+        assert_eq!(envelope["error"]["code"], "transport_unavailable");
+        assert_eq!(envelope["error"]["details"]["connect_error"], true);
+        assert_eq!(envelope["error"]["details"]["attempts"], 4);
+        assert!(envelope["error"]["details"]["io_kind"].is_string());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("TEAM_CLI_HTTP_BRIDGE_FAILED"));
+    }
+}
+
+#[tokio::test]
+async fn backend_failure_does_not_claim_task_completion_or_retry_a_mutation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{Json, Router, http::StatusCode, routing::post};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = received.clone();
+    let app = Router::new().route(
+        "/api/runtime/team-tools/call",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "success": false, "error": { "code": "transport_unavailable", "message": "backend unavailable" } })),
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let output = run_team_call(
+        &base_url,
+        &["task", "update"],
+        r#"{"task_id":"task-1","status":"completed"}"#,
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(3));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["error"]["code"], "transport_unavailable");
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn failure_envelope_with_http_ok_does_not_claim_report_delivery() {
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    let app = Router::new().route(
+        "/api/runtime/team-tools/call",
+        post(|| async {
+            Json(json!({
+                "success": false,
+                "error": { "code": "transport_unavailable", "message": "delivery failed" }
+            }))
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let output = run_team_call(&base_url, &["send-message"], r#"{"to":"lead-1","message":"done"}"#).await;
+    assert_eq!(output.status.code(), Some(3));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["error"]["code"], "transport_unavailable");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("TEAM_CLI_RESPONSE_ERROR"));
+    server.abort();
+}
