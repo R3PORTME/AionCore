@@ -1835,6 +1835,14 @@ impl TeamSession {
         self.scheduler.update_agent_model(slot_id, model).await
     }
 
+    pub async fn update_agent_routing(
+        &self,
+        slot_id: &str,
+        routing: aionui_api_types::TeamRouting,
+    ) -> Result<(), TeamError> {
+        self.scheduler.update_agent_routing(slot_id, routing).await
+    }
+
     /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
     ///
     /// Validation chain mirrors the assistant-first team contract:

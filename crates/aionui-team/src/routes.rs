@@ -16,6 +16,7 @@ use aionui_api_types::{
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamFreshRunRequest, TeamFreshRunResponse, TeamInterruptAgentResponse, TeamListResponse,
     TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    UpdateAgentRoutingRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -187,6 +188,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/routing",
+            axum::routing::patch(update_agent_routing),
+        )
         .route(
             "/api/teams/{id}/agents/{slot_id}/name",
             axum::routing::patch(rename_agent),
@@ -422,6 +427,20 @@ async fn add_agent(
     let Json(req) = body.map_err(ApiError::from)?;
     let agent = state.service.add_agent(&user.id, &id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
+}
+
+async fn update_agent_routing(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<UpdateAgentRoutingRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamAgentResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let agent = state
+        .service
+        .update_agent_routing(&user.id, &params.id, &params.slot_id, req.routing)
+        .await?;
+    Ok(Json(ApiResponse::ok(agent)))
 }
 
 async fn remove_agent(

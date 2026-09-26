@@ -212,6 +212,13 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
     }
 }
 
+/// Request body for `PATCH /api/teams/:id/agents/:slotId/routing`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAgentRoutingRequest {
+    pub routing: TeamRouting,
+}
+
 /// Request body for `PATCH /api/teams/:id/agents/:slotId/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameAgentRequest {
@@ -919,6 +926,29 @@ mod tests {
             "agents": [{"name": "Builder", "role": "teammate", "model": "any", "assistant_id": "assistant-1", "routing": "model-name"}]
         })).is_err());
         assert_eq!(serde_json::to_value(TeamRouting::Coordinator).unwrap(), "coordinator");
+    }
+
+    #[test]
+    fn routing_update_request_requires_a_typed_routing_value() {
+        let request: UpdateAgentRoutingRequest = serde_json::from_value(json!({
+            "routing": "implementation_primary"
+        }))
+        .unwrap();
+        assert_eq!(request.routing, TeamRouting::ImplementationPrimary);
+        assert!(serde_json::from_value::<UpdateAgentRoutingRequest>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<UpdateAgentRoutingRequest>(json!({
+                "routing": "assistant-name"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<UpdateAgentRoutingRequest>(json!({
+                "routing": "independent_review",
+                "assistant_id": "must-not-be-accepted"
+            }))
+            .is_err()
+        );
     }
     // -- Unified team activity feed -------------------------------------------
 

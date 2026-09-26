@@ -214,7 +214,7 @@ pub use team::{
     TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
     TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
     TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange, TeamTaskChangedPayload, TeamTaskResponse,
-    TeammateMessagePayload, assistant_mcp_binding_fingerprint,
+    TeammateMessagePayload, UpdateAgentRoutingRequest, assistant_mcp_binding_fingerprint,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

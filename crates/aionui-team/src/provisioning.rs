@@ -211,7 +211,10 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 }
 
 impl TeamAgentProvisioner {
-    fn validated_routing(role: TeammateRole, requested: Option<TeamRouting>) -> Result<TeamRouting, TeamError> {
+    pub(crate) fn validated_routing(
+        role: TeammateRole,
+        requested: Option<TeamRouting>,
+    ) -> Result<TeamRouting, TeamError> {
         let routing = requested.unwrap_or(match role {
             TeammateRole::Lead => TeamRouting::Coordinator,
             TeammateRole::Teammate => TeamRouting::Unassigned,
