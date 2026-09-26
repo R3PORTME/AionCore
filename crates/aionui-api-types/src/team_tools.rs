@@ -349,12 +349,12 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
+            description: "Send a message to a teammate or broadcast to every other team member (to=\"*\"). A broadcast queues a message to and wakes every recipient. Use broadcast only when every recipient needs actionable information now; never use it merely to announce task completion. When delegating work that depends on user attachments, forward their absolute paths in files.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
+                    "to": { "type": "string", "description": "Target agent slot_id, or \"*\" to message and wake every other team member" },
                     "message": { "type": "string", "description": "Message content" },
                     "files": {
                         "type": "array",
