@@ -253,10 +253,18 @@ mod tests {
     fn lead_prompt_contains_core_sections() {
         let assistants = default_assistants();
         let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
+        let normalized_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
 
         // Workflow uses tools for dynamic state.
         assert!(prompt.contains("## Workflow"));
         assert!(prompt.contains("FIRST call `team_members`"));
+        assert!(normalized_prompt.contains("a strict coordinator for coding work"));
+        assert!(normalized_prompt.contains("`Implement Issue #N`"));
+        assert!(normalized_prompt.contains(
+            "For every coding request, call `team_members` and inspect the current roster before assigning the work"
+        ));
+        assert!(normalized_prompt.contains("Consider existing teammates before proposing or using `team_spawn_agent`"));
+        assert!(normalized_prompt.contains("After dispatching actionable coding work, end your turn"));
         assert!(prompt.contains("call `team_list_assistants`"));
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
