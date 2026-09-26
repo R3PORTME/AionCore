@@ -580,9 +580,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_shell_path_roundtrip_with_sh() {
+        // A login shell reads startup files, so give it a known PATH entry
+        // instead of inheriting the developer's profile or interactive ENV.
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(home.path().join("probe-bin")).unwrap();
+        std::fs::write(
+            home.path().join(".profile"),
+            "PATH=\"$HOME/probe-bin:/usr/bin:/bin\"\nexport PATH\n",
+        )
+        .unwrap();
+        let empty_env = home.path().join("empty-env");
+        std::fs::write(&empty_env, "").unwrap();
+
         if !run_in_env_child(
             "shell_env::tests::login_shell_path_roundtrip_with_sh",
-            &[("SHELL", "/bin/sh")],
+            &[
+                ("SHELL", "/bin/sh"),
+                ("HOME", home.path().to_str().unwrap()),
+                ("ENV", empty_env.to_str().unwrap()),
+            ],
             &[],
         ) {
             return;
@@ -590,7 +606,8 @@ mod tests {
         let (result, report) = login_shell_path();
         assert!(result.is_some(), "login shell probe should return Some");
         let path = result.unwrap();
-        assert!(!path.is_empty(), "login shell PATH should not be empty");
+        let expected_bin = std::path::Path::new(&std::env::var("HOME").unwrap()).join("probe-bin");
+        assert_eq!(path.split(':').next(), expected_bin.to_str());
         assert_eq!(report.status, ShellProbeStatus::Ok);
     }
 
