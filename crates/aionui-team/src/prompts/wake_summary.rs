@@ -336,6 +336,7 @@ mod tests {
             slot_id: slot_id.to_owned(),
             name: "Worker".to_owned(),
             role,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "conv-1".to_owned(),
             backend: "acp".to_owned(),
             model: "claude".to_owned(),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SetConfigOptionRequest, SetConfigOptionResponse,
-    TeamAgentInput, TeamMcpSelection, TeamToolTransport, assistant_mcp_binding_fingerprint,
+    TeamAgentInput, TeamMcpSelection, TeamRouting, TeamToolTransport, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
@@ -47,6 +47,7 @@ struct NewAgentProvisioning {
     slot_id: String,
     name: String,
     role: TeammateRole,
+    routing: TeamRouting,
     backend: String,
     model: String,
     assistant_id: Option<String>,
@@ -62,6 +63,7 @@ pub(crate) struct PersistSpawnedAgentRequest {
     pub backend: String,
     pub model: String,
     pub assistant_id: Option<String>,
+    pub routing: TeamRouting,
 }
 
 pub struct TeamConversationCreateRequest {
@@ -209,6 +211,24 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 }
 
 impl TeamAgentProvisioner {
+    pub(crate) fn validated_routing(
+        role: TeammateRole,
+        requested: Option<TeamRouting>,
+    ) -> Result<TeamRouting, TeamError> {
+        let routing = requested.unwrap_or(match role {
+            TeammateRole::Lead => TeamRouting::Coordinator,
+            TeammateRole::Teammate => TeamRouting::Unassigned,
+        });
+        if (role == TeammateRole::Lead && routing != TeamRouting::Coordinator)
+            || (role == TeammateRole::Teammate && routing == TeamRouting::Coordinator)
+        {
+            return Err(TeamError::InvalidRequest(
+                "routing must match the team agent role".into(),
+            ));
+        }
+        Ok(routing)
+    }
+
     fn normalized_role(input: &TeamAgentInput) -> Result<TeammateRole, TeamError> {
         TeammateRole::parse(input.role.trim())
             .ok_or_else(|| TeamError::InvalidRequest(format!("invalid team agent role: {}", input.role)))
@@ -257,6 +277,11 @@ impl TeamAgentProvisioner {
         let roles = inputs
             .iter()
             .map(Self::normalized_role)
+            .collect::<Result<Vec<_>, _>>()?;
+        let routings = inputs
+            .iter()
+            .zip(&roles)
+            .map(|(input, role)| Self::validated_routing(*role, input.routing))
             .collect::<Result<Vec<_>, _>>()?;
         let leaders = roles
             .iter()
@@ -318,6 +343,7 @@ impl TeamAgentProvisioner {
             slot_id: leader_slot_id.clone(),
             name: leader_input.name.clone(),
             role: leader_role,
+            routing: routings[*leader_idx],
             conversation_id: leader_conversation.conversation_id,
             backend: leader_backend,
             model: leader_input.model.clone(),
@@ -327,10 +353,11 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for (input, role) in inputs
+        for ((input, role), routing) in inputs
             .iter()
             .zip(roles.iter())
-            .filter(|(_, role)| **role == TeammateRole::Teammate)
+            .zip(routings.iter())
+            .filter(|((_, role), _)| **role == TeammateRole::Teammate)
         {
             let slot_id = generate_id();
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
@@ -359,6 +386,7 @@ impl TeamAgentProvisioner {
                 slot_id,
                 name: input.name.clone(),
                 role: *role,
+                routing: *routing,
                 conversation_id: conversation.conversation_id,
                 backend,
                 model: input.model.clone(),
@@ -401,6 +429,7 @@ impl TeamAgentProvisioner {
                 "add_agent only supports teammate role".into(),
             ));
         }
+        let routing = Self::validated_routing(role, req.routing)?;
         let workspace = self.workspace_resolver().resolve_for_new_agent(row, team).await?;
         let assistant_id = Self::effective_assistant_id(req.assistant_id.as_deref());
         let backend = self
@@ -418,6 +447,7 @@ impl TeamAgentProvisioner {
                     slot_id: generate_id(),
                     name: req.name,
                     role,
+                    routing,
                     backend,
                     model: req.model,
                     assistant_id,
@@ -478,6 +508,7 @@ impl TeamAgentProvisioner {
                     slot_id: req.slot_id,
                     name: req.name,
                     role: TeammateRole::Teammate,
+                    routing: req.routing,
                     backend: req.backend,
                     model: req.model,
                     assistant_id: req.assistant_id,
@@ -731,6 +762,7 @@ impl TeamAgentProvisioner {
             slot_id: input.slot_id,
             name: input.name,
             role: input.role,
+            routing: input.routing,
             conversation_id: conversation.conversation_id,
             backend: input.backend,
             model: input.model,
@@ -1442,6 +1474,7 @@ mod tests {
             slot_id: "slot-1".into(),
             name: "Agent".into(),
             role: TeammateRole::Teammate,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "conv-1".into(),
             backend: "acp".into(),
             model: "sonnet".into(),
@@ -1687,6 +1720,7 @@ mod tests {
         let inputs = vec![TeamAgentInput {
             name: "Lead".into(),
             role: "lead".into(),
+            routing: None,
             backend: Some("aionrs".into()),
             model: "test-model".into(),
             assistant_id: Some("assistant-1".into()),

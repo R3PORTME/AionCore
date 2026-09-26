@@ -85,4 +85,17 @@ impl TeammateManager {
         debug!(team_id = %self.team_id, slot_id, model, "agent model updated");
         Ok(())
     }
+
+    pub async fn update_agent_routing(
+        &self,
+        slot_id: &str,
+        routing: aionui_api_types::TeamRouting,
+    ) -> Result<(), TeamError> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .get_mut(slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        slot.agent.routing = routing;
+        Ok(())
+    }
 }

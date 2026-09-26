@@ -9,6 +9,19 @@ use crate::{ConversationMcpStatus, SessionMcpServer};
 // A. Team management — Request DTOs
 // ---------------------------------------------------------------------------
 
+/// Provider-neutral responsibility assigned to a Team roster slot.
+/// `unassigned` is the compatibility value for legacy teammates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRouting {
+    Coordinator,
+    ImplementationPrimary,
+    ImplementationEscalation,
+    IndependentReview,
+    #[default]
+    Unassigned,
+}
+
 // ---------------------------------------------------------------------------
 // B. Team MCP selection
 // ---------------------------------------------------------------------------
@@ -52,6 +65,7 @@ pub struct TeamAgentInput {
     pub backend: Option<String>,
     pub model: String,
     pub assistant_id: Option<String>,
+    pub routing: Option<TeamRouting>,
     /// Deprecated request-side field retained so old clients receive a clear
     /// validation error instead of silently reusing a solo conversation.
     ///
@@ -69,6 +83,8 @@ struct TeamAgentInputCompat {
     pub model: String,
     #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub routing: Option<TeamRouting>,
 }
 
 fn normalize_assistant_id(assistant_id: Option<String>) -> Option<String> {
@@ -92,6 +108,7 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
             backend: None,
             model: raw.model,
             assistant_id: Some(assistant_id),
+            routing: raw.routing,
             conversation_id: raw.conversation_id,
         })
     }
@@ -141,6 +158,7 @@ pub struct AddAgentRequest {
     pub backend: Option<String>,
     pub model: String,
     pub assistant_id: Option<String>,
+    pub routing: Option<TeamRouting>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +174,8 @@ struct AddAgentRequestCompat {
     model: Option<String>,
     #[serde(default)]
     assistant_id: Option<String>,
+    #[serde(default)]
+    routing: Option<TeamRouting>,
 }
 
 impl<'de> Deserialize<'de> for AddAgentRequest {
@@ -171,6 +191,7 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
                 backend: None,
                 model: assistant.model,
                 assistant_id: assistant.assistant_id,
+                routing: assistant.routing,
             });
         }
 
@@ -186,8 +207,16 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
             backend: None,
             model,
             assistant_id: Some(assistant_id),
+            routing: raw.routing,
         })
     }
+}
+
+/// Request body for `PATCH /api/teams/:id/agents/:slotId/routing`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAgentRoutingRequest {
+    pub routing: TeamRouting,
 }
 
 /// Request body for `PATCH /api/teams/:id/agents/:slotId/name`.
@@ -578,6 +607,8 @@ pub struct TeamAgentResponse {
     pub assistant_name: String,
     pub name: String,
     pub role: String,
+    #[serde(default)]
+    pub routing: TeamRouting,
     pub conversation_id: String,
     #[serde(default)]
     pub assistant_backend: String,
@@ -870,6 +901,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn routing_is_typed_in_create_and_add_inputs() {
+        let created: CreateTeamRequest = serde_json::from_value(serde_json::json!({
+            "name": "Team",
+            "agents": [{"name": "Builder", "role": "teammate", "model": "any", "assistant_id": "assistant-1", "routing": "implementation_primary"}]
+        }))
+        .unwrap();
+        assert_eq!(created.agents[0].routing, Some(TeamRouting::ImplementationPrimary));
+
+        let added: AddAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "Reviewer", "role": "teammate", "model": "any", "assistant_id": "assistant-2", "routing": "independent_review"
+        }))
+        .unwrap();
+        assert_eq!(added.routing, Some(TeamRouting::IndependentReview));
+
+        let nested: AddAgentRequest = serde_json::from_value(serde_json::json!({
+            "assistant": {"name": "Escalation", "role": "teammate", "model": "any", "assistant_id": "assistant-3", "routing": "implementation_escalation"}
+        }))
+        .unwrap();
+        assert_eq!(nested.routing, Some(TeamRouting::ImplementationEscalation));
+        assert!(serde_json::from_value::<CreateTeamRequest>(serde_json::json!({
+            "name": "Team",
+            "agents": [{"name": "Builder", "role": "teammate", "model": "any", "assistant_id": "assistant-1", "routing": "model-name"}]
+        })).is_err());
+        assert_eq!(serde_json::to_value(TeamRouting::Coordinator).unwrap(), "coordinator");
+    }
+
+    #[test]
+    fn routing_update_request_requires_a_typed_routing_value() {
+        let request: UpdateAgentRoutingRequest = serde_json::from_value(json!({
+            "routing": "implementation_primary"
+        }))
+        .unwrap();
+        assert_eq!(request.routing, TeamRouting::ImplementationPrimary);
+        assert!(serde_json::from_value::<UpdateAgentRoutingRequest>(json!({})).is_err());
+        assert!(
+            serde_json::from_value::<UpdateAgentRoutingRequest>(json!({
+                "routing": "assistant-name"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<UpdateAgentRoutingRequest>(json!({
+                "routing": "independent_review",
+                "assistant_id": "must-not-be-accepted"
+            }))
+            .is_err()
+        );
+    }
     // -- Unified team activity feed -------------------------------------------
 
     #[test]
@@ -1233,6 +1313,7 @@ mod tests {
             assistant_name: "Lead Agent".into(),
             name: "Lead Agent".into(),
             role: "lead".into(),
+            routing: TeamRouting::Unassigned,
             conversation_id: "conv-1".into(),
             assistant_backend: "acp".into(),
             backend: "acp".into(),
@@ -1269,6 +1350,7 @@ mod tests {
             assistant_name: "Worker".into(),
             name: "Worker".into(),
             role: "teammate".into(),
+            routing: TeamRouting::Unassigned,
             conversation_id: "conv-2".into(),
             assistant_backend: "acp".into(),
             backend: "acp".into(),
@@ -1299,6 +1381,7 @@ mod tests {
                 assistant_name: "Lead".into(),
                 name: "Lead".into(),
                 role: "lead".into(),
+                routing: TeamRouting::Unassigned,
                 conversation_id: "conv-1".into(),
                 assistant_backend: "acp".into(),
                 backend: "acp".into(),
@@ -1367,6 +1450,7 @@ mod tests {
                 assistant_name: "Dynamic Worker".into(),
                 name: "Dynamic Worker".into(),
                 role: "teammate".into(),
+                routing: TeamRouting::Unassigned,
                 conversation_id: "conv-3".into(),
                 assistant_backend: "claude".into(),
                 backend: "claude".into(),
@@ -1422,6 +1506,7 @@ mod tests {
             assistant_name: "Agent".into(),
             name: "Agent".into(),
             role: "lead".into(),
+            routing: TeamRouting::Unassigned,
             conversation_id: "conv-1".into(),
             assistant_backend: "acp".into(),
             backend: "acp".into(),
@@ -1452,6 +1537,7 @@ mod tests {
                     assistant_name: "Lead".into(),
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: TeamRouting::Unassigned,
                     conversation_id: "c1".into(),
                     assistant_backend: "acp".into(),
                     backend: "acp".into(),
@@ -1470,6 +1556,7 @@ mod tests {
                     assistant_name: "Worker".into(),
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: TeamRouting::Unassigned,
                     conversation_id: "c2".into(),
                     assistant_backend: "acp".into(),
                     backend: "acp".into(),
@@ -1514,6 +1601,7 @@ mod tests {
                 assistant_name: "New".into(),
                 name: "New".into(),
                 role: "teammate".into(),
+                routing: TeamRouting::Unassigned,
                 conversation_id: "c3".into(),
                 assistant_backend: "claude".into(),
                 backend: "claude".into(),

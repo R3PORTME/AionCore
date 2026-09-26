@@ -134,7 +134,7 @@ struct ReadMessagesParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct SendMessageParams {
-    /// Target agent slot_id or "*" for broadcast.
+    /// Target agent slot_id, or "*" to message and wake every other team member.
     to: String,
     /// Message content.
     message: String,
@@ -166,6 +166,9 @@ struct SpawnAgentParams {
     /// Assistant identifier from the available assistants catalog.
     #[serde(default)]
     assistant_id: Option<String>,
+    /// Routing responsibility: implementation_primary, implementation_escalation, independent_review, or unassigned.
+    #[serde(default)]
+    routing: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -308,7 +311,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_send_message",
-        description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
+        description = "Send a message to a teammate or broadcast to every other team member (to=\"*\"). A broadcast queues a message to and wakes every recipient. Use broadcast only when every recipient needs actionable information now; never use it merely to announce task completion. When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
         self.forward_to_tcp(
@@ -349,6 +352,7 @@ impl TeamStdioServer {
             &serde_json::json!({
                 "name": params.name,
                 "assistant_id": params.assistant_id,
+                "routing": params.routing,
             }),
         )
         .await
@@ -946,6 +950,17 @@ mod tests {
                 spec.name
             );
         }
+
+        let send_message = tools
+            .iter()
+            .find(|tool| tool.name == "team_send_message")
+            .expect("team_send_message tool missing");
+        assert!(
+            send_message.input_schema["properties"]["to"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("message and wake every other team member")
+        );
     }
 
     #[test]
@@ -1119,7 +1134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_forwards_only_assistant_first_arguments() {
+    async fn spawn_agent_forwards_assistant_binding_and_routing() {
         let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept_task = tokio::spawn(async move {
@@ -1139,6 +1154,7 @@ mod tests {
             let arguments = &call_value["params"]["arguments"];
             assert_eq!(arguments["name"], json!("CodexCLI"));
             assert_eq!(arguments["assistant_id"], json!("bare:8e1acf31"));
+            assert_eq!(arguments["routing"], json!("implementation_primary"));
             assert!(arguments.get("model").is_none());
             assert!(arguments.get("role").is_none());
             assert!(arguments.get("agent_type").is_none());
@@ -1165,6 +1181,7 @@ mod tests {
             .spawn_agent(Parameters(SpawnAgentParams {
                 name: "CodexCLI".into(),
                 assistant_id: Some("bare:8e1acf31".into()),
+                routing: Some("implementation_primary".into()),
             }))
             .await;
 

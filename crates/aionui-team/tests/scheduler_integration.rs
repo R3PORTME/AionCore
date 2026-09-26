@@ -46,6 +46,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         slot_id: slot_id.into(),
         name: name.into(),
         role,
+        routing: aionui_api_types::TeamRouting::Unassigned,
         conversation_id: format!("conv-{slot_id}"),
         backend: "acp".into(),
         model: "claude".into(),

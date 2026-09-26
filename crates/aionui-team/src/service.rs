@@ -14,9 +14,10 @@ use aionui_api_types::{
     InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
     TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunResponse,
-    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
-    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRouting, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -1069,6 +1070,68 @@ impl TeamSessionService {
         }
 
         self.build_agent_response(user_id, team_id, &agent).await
+    }
+
+    pub async fn update_agent_routing(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        requested_routing: TeamRouting,
+    ) -> Result<TeamAgentResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let agent_index = team
+            .agents
+            .iter()
+            .position(|agent| agent.slot_id == slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let role = team.agents[agent_index].role;
+        let routing = TeamAgentProvisioner::validated_routing(role, Some(requested_routing))?;
+        let updated_agent = {
+            let agent = &mut team.agents[agent_index];
+            agent.routing = routing;
+            agent.clone()
+        };
+
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        if let Some(session) = &session {
+            // Fail before persistence if the published session cannot observe
+            // this roster slot. Membership mutations and session startup share
+            // this lock, so a successful database write can be applied in-place.
+            let live_agent = session.scheduler().get_agent(slot_id).await?;
+            if live_agent.role != role || live_agent.conversation_id != updated_agent.conversation_id {
+                return Err(TeamError::InvalidRequest(
+                    "active team session roster does not match the persisted member".into(),
+                ));
+            }
+        }
+
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(serde_json::to_string(&team.agents)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if let Some(session) = session {
+            session.update_agent_routing(slot_id, routing).await?;
+        }
+        info!(team_id, slot_id, routing = ?routing, "team agent routing updated");
+        drop(_guard);
+        drop(_lifecycle_guard);
+        self.build_agent_response(user_id, team_id, &updated_agent).await
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
@@ -3440,7 +3503,8 @@ mod tests {
     };
     use aionui_api_types::{
         AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionRequest, SetConfigOptionResponse,
-        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
+        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRouting,
+        TeamRunTargetRole,
     };
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
@@ -3673,6 +3737,7 @@ mod tests {
                 aionui_api_types::TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3681,6 +3746,7 @@ mod tests {
                 aionui_api_types::TeamAgentInput {
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3696,6 +3762,7 @@ mod tests {
         request.agents.push(aionui_api_types::TeamAgentInput {
             name: "Butler".into(),
             role: "teammate".into(),
+            routing: None,
             backend: Some("aionrs".into()),
             model: "claude-sonnet".into(),
             assistant_id: None,
@@ -3828,6 +3895,61 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(assistant.conversation_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn routing_update_is_immediately_visible_to_team_members_in_active_session() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Routing Update"))
+            .await
+            .unwrap();
+        let teammate = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap()
+            .clone();
+        assert_eq!(teammate.routing, TeamRouting::Unassigned);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let lead_slot_id = created.leader_assistant_id.as_deref().unwrap();
+        let updated = svc
+            .update_agent_routing(
+                "user-test",
+                &created.id,
+                &teammate.slot_id,
+                TeamRouting::ImplementationPrimary,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.routing, TeamRouting::ImplementationPrimary);
+
+        let live = session.scheduler().get_agent(&teammate.slot_id).await.unwrap();
+        assert_eq!(live.routing, TeamRouting::ImplementationPrimary);
+        assert_eq!(live.conversation_id, teammate.conversation_id);
+        let service = Arc::downgrade(&svc);
+        let members = crate::mcp::server::dispatch_tool(
+            "team_members",
+            &serde_json::json!({}),
+            session.scheduler(),
+            &service,
+            &created.id,
+            lead_slot_id,
+            crate::types::TeammateRole::Lead,
+        )
+        .await
+        .unwrap();
+        let members: serde_json::Value = serde_json::from_str(&members).unwrap();
+        let member = members
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["slot_id"] == teammate.slot_id)
+            .unwrap();
+        assert_eq!(member["routing"], "implementation_primary");
+        svc.stop_session("user-test", &created.id).await.unwrap();
     }
 
     #[tokio::test]
@@ -4829,6 +4951,7 @@ mod tests {
                 AddAgentRequest {
                     name: "Worker".to_owned(),
                     role: "teammate".to_owned(),
+                    routing: None,
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
                     assistant_id: None,
@@ -4904,6 +5027,7 @@ mod tests {
             AddAgentRequest {
                 name: "Worker".to_owned(),
                 role: "teammate".to_owned(),
+                routing: None,
                 backend: Some("acp".to_owned()),
                 model: "claude".to_owned(),
                 assistant_id: None,
@@ -4947,6 +5071,7 @@ mod tests {
                 AddAgentRequest {
                     name: "Worker".to_owned(),
                     role: "teammate".to_owned(),
+                    routing: None,
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
                     assistant_id: None,

@@ -349,12 +349,12 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
+            description: "Send a message to a teammate or broadcast to every other team member (to=\"*\"). A broadcast queues a message to and wakes every recipient. Use broadcast only when every recipient needs actionable information now; never use it merely to announce task completion. When delegating work that depends on user attachments, forward their absolute paths in files.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
+                    "to": { "type": "string", "description": "Target agent slot_id, or \"*\" to message and wake every other team member" },
                     "message": { "type": "string", "description": "Message content" },
                     "files": {
                         "type": "array",
@@ -511,7 +511,8 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
-                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
+                    "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." },
+                    "routing": { "type": "string", "enum": ["implementation_primary", "implementation_escalation", "independent_review", "unassigned"], "description": "Provider-neutral responsibility for the new teammate." }
                 },
                 "required": ["name", "assistant_id"]
             }),

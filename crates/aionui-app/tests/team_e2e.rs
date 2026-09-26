@@ -336,6 +336,229 @@ async fn tc4_explicit_lead_is_returned_first() {
     );
 }
 
+#[tokio::test]
+async fn routing_survives_create_add_list_get_and_fresh_run() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let body = two_agent_body();
+    let created = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/teams", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = body_json(created).await["data"].clone();
+    let team_id = created["id"].as_str().unwrap();
+    assert_eq!(created["assistants"][0]["routing"], "coordinator");
+    assert_eq!(created["assistants"][1]["routing"], "unassigned");
+    let original_workspace = created["workspace"].clone();
+    let original_agents = created["assistants"].as_array().unwrap().clone();
+    let worker_slot_id = created["assistants"][1]["slot_id"].as_str().unwrap();
+
+    let primary = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{worker_slot_id}/routing"),
+            json!({"routing": "implementation_primary"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let primary_status = primary.status();
+    let primary_body = body_json(primary).await;
+    assert_eq!(primary_status, StatusCode::OK, "{primary_body}");
+    assert_eq!(primary_body["data"]["routing"], "implementation_primary");
+
+    let added_body = team_agent("Escalation", "teammate");
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents"),
+            added_body,
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+    let escalation = body_json(added).await["data"].clone();
+    assert_eq!(escalation["routing"], "unassigned");
+    let escalation_slot_id = escalation["slot_id"].as_str().unwrap();
+    let escalation_update = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{escalation_slot_id}/routing"),
+            json!({"routing": "implementation_escalation"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(escalation_update.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(escalation_update).await["data"]["routing"],
+        "implementation_escalation"
+    );
+
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents"),
+            team_agent("Reviewer", "teammate"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+    let reviewer = body_json(added).await["data"].clone();
+    let reviewer_slot_id = reviewer["slot_id"].as_str().unwrap();
+    let review_update = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{reviewer_slot_id}/routing"),
+            json!({"routing": "independent_review"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(review_update.status(), StatusCode::OK);
+    assert_eq!(body_json(review_update).await["data"]["routing"], "independent_review");
+
+    let list = app.clone().oneshot(get_with_token("/api/teams", &token)).await.unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list = body_json(list).await;
+    let listed = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["id"] == team_id)
+        .unwrap();
+    assert_eq!(listed["assistants"][1]["routing"], "implementation_primary");
+    assert_eq!(listed["assistants"][2]["routing"], "implementation_escalation");
+    assert_eq!(listed["assistants"][3]["routing"], "independent_review");
+    for original in &original_agents {
+        let updated = listed["assistants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["slot_id"] == original["slot_id"])
+            .unwrap();
+        for identity_field in ["slot_id", "name", "role", "conversation_id", "assistant_id", "model"] {
+            assert_eq!(
+                updated[identity_field], original[identity_field],
+                "{identity_field} changed"
+            );
+        }
+    }
+    assert_eq!(listed["workspace"], original_workspace);
+
+    let workspace = std::env::temp_dir().join(format!("aionui-routing-fresh-{team_id}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let fresh_workspace = workspace.to_string_lossy().to_string();
+    let fresh = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({"workspace": fresh_workspace}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let got = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let got = body_json(got).await;
+    assert_eq!(got["data"]["assistants"][0]["routing"], "coordinator");
+    assert_eq!(got["data"]["assistants"][1]["routing"], "implementation_primary");
+    assert_eq!(got["data"]["assistants"][2]["routing"], "implementation_escalation");
+    assert_eq!(got["data"]["assistants"][3]["routing"], "independent_review");
+    assert_eq!(got["data"]["workspace"], fresh_workspace);
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn routing_rejects_role_mismatch() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let mut body = two_agent_body();
+    body["agents"][1]["routing"] = json!("coordinator");
+    let response = app
+        .oneshot(json_with_token("POST", "/api/teams", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = body_json(response).await;
+    assert!(response["error"].as_str().unwrap().contains("routing must match"));
+}
+
+#[tokio::test]
+async fn routing_update_rejects_invalid_roles_and_unauthenticated_requests() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let created = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = created["id"].as_str().unwrap();
+    let lead_slot_id = created["assistants"][0]["slot_id"].as_str().unwrap();
+    let teammate_slot_id = created["assistants"][1]["slot_id"].as_str().unwrap();
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{teammate_slot_id}/routing"),
+            json!({"routing": "implementation_primary"}),
+            "invalid-token",
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    for (slot_id, routing) in [
+        (teammate_slot_id, "coordinator"),
+        (lead_slot_id, "implementation_primary"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "PATCH",
+                &format!("/api/teams/{team_id}/agents/{slot_id}/routing"),
+                json!({"routing": routing}),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("routing must match"));
+    }
+
+    let unchanged = app
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let unchanged = body_json(unchanged).await;
+    assert_eq!(unchanged["data"]["assistants"][0]["routing"], "coordinator");
+    assert_eq!(unchanged["data"]["assistants"][1]["routing"], "unassigned");
+}
+
 // TC-5: Empty agents returns 400
 #[tokio::test]
 async fn tc5_empty_agents_returns_error() {

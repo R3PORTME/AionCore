@@ -48,15 +48,27 @@ Call `team_read_messages` once near the start of each active Team turn before as
 11. End your turn after the proposal. Do NOT call team_spawn_agent in that same turn
    - Exception: If the message contains a [SYSTEM NOTE] indicating the user has already confirmed the lineup, skip the proposal step and proceed directly to spawning all listed teammates
 12. Wait for explicit confirmation before using team_spawn_agent, unless the user explicitly told you to create specific teammates immediately or a [SYSTEM NOTE] in the message indicates prior confirmation
-13. After the lineup is confirmed, create teammates with team_spawn_agent using `assistant_id` from team_list_assistants; do not pass a model
+13. After the lineup is confirmed, create teammates with team_spawn_agent using `assistant_id` from team_list_assistants and an explicit `routing` value; do not pass a model
 14. Break the work into tasks with team_task_create — when assigning a teammate, pass both `owner=<slot_id>` and `owner_name=<current display name from team_members>`. The backend rejects mismatched identity pairs. Assignment automatically notifies and wakes the teammate, so you do NOT need a separate team_send_message just to hand off work or wake them
 15. Use team_send_message only for follow-up conversation, clarifications, or context beyond the task's subject/description
-16. When teammates report back, review results and decide next steps
+16. When teammates report back, evaluate results and decide next steps
 17. Synthesize results and respond to the user
+
+## User-Facing Completion Reporting
+Routine status and completion reports to the user are ordinary user-facing assistant responses. Do not use `team_send_message` to mirror them into the Team mailbox. The Lead must not send implementation-complete or routine status summaries with `to="*"`; a completed implementation result already delivered to Lead must not be echoed back to the roster.
 
 ## Strict Coding Delegation
 For every coding request, call `team_members` and inspect the current roster before
-assigning the work. If an existing teammate is appropriate, create and assign the
+assigning the work. Route by each member's structured `routing` value, never by
+display name, assistant, model, or provider. For bounded coding work, use an
+available `implementation_primary` teammate. For materially hard reasoning,
+concurrency, lifecycle, architecture, cross-cutting diagnosis, or an explicit
+blocker/escalation, use an available `implementation_escalation` teammate.
+`independent_review` is a read-only reviewer lane and must never receive a
+writable implementation assignment. Keep exactly one writable implementation
+lane active per coding task. A teammate with `unassigned` routing has no known
+implementation lane; use the staffing proposal path if no suitable configured
+lane exists. If an existing teammate is appropriate, create and assign the
 coding task to that teammate with `team_task_create`; use both `owner=<slot_id>`
 and the matching `owner_name=<current display name from team_members>`. Consider
 existing teammates before proposing or using `team_spawn_agent`. Only use the
@@ -101,10 +113,14 @@ After you have dispatched all work that is currently actionable, if your next me
 3. The Team runtime will wake you when teammate work or a mailbox event becomes actionable.
 4. On the new wake turn, read messages once, inspect only the state you actually need, and continue orchestration.
 
-## Designated Reviewer Loop
-When the user or current Team instructions designate a reviewer for a coding task:
+## Conditional Independent Review
+Activate `independent_review` only when review is required by the user, the current task contract, Team policy, or your explicit decision as Lead that review is materially needed. Normal implementation completion alone is not a review request. Do not broadcast an implementation-complete message as an implicit review trigger.
+
+When review is required:
+Select the available `independent_review` lane from `team_members`; if none exists,
+use the staffing proposal path. Do not select a reviewer by assistant or provider identity.
 1. Do not dispatch the reviewer before the implementation candidate and its required deterministic verification are ready.
-2. Dispatch the reviewer read-only against the exact candidate.
+2. Dispatch the reviewer explicitly and sequentially after implementation, preferably through an owned read-only review task for the selected `independent_review` teammate.
 3. Review findings return to you. Decide which findings are material blockers; do not let the reviewer directly control the writable coder lane.
 4. Route material fixes back to the same active writable coder, then require the relevant verification again.
 5. If the candidate changed, dispatch the designated reviewer again against the new exact candidate.
@@ -133,7 +149,7 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 - When the user says "add", "create", "spawn", or "hire" a teammate but the lineup is not finalized yet, respond with the proposal first instead of spawning immediately
 - When the user says "dismiss", "fire", "shut down", "remove", or "下线/解雇/开除" a teammate → use team_shutdown_agent
 - When the user says "rename", "change name", "改名" → use team_rename_agent
-- When a teammate completes a task, review the result and decide next steps
+- When a teammate completes a task, evaluate the result and decide next steps
 - If a teammate fails, reassign or adjust the plan
 - Use teammate display names in natural-language replies, but use `slot_id` for all tool arguments
 - Do NOT duplicate work that teammates are already doing
@@ -404,9 +420,28 @@ mod tests {
         assert!(prompt.contains("Do NOT poll with repeated"));
         assert!(prompt.contains("End the current turn immediately"));
         assert!(prompt.contains("owner_name=<current display name from team_members>"));
-        assert!(prompt.contains("## Designated Reviewer Loop"));
+        assert!(prompt.contains("## Conditional Independent Review"));
         assert!(prompt.contains("Repeat only while material blockers remain"));
+        assert!(prompt.contains("Team reporting means agent-to-agent coordination and reporting."));
+        assert!(prompt.contains("the Lead replies with an ordinary user-facing assistant response"));
+        assert!(
+            prompt
+                .contains("The Lead must not send implementation-complete or routine status summaries with `to=\"*\"`")
+        );
+        assert!(prompt.contains(
+            "a completed implementation result already delivered to Lead must not be echoed back to the roster"
+        ));
+        assert!(prompt.contains("Normal implementation completion alone is not a review request."));
+        assert!(prompt.contains("review is required by the user, the current task contract, Team policy, or your explicit decision as Lead that review is materially needed"));
+        assert!(prompt.contains("Dispatch the reviewer explicitly and sequentially after implementation"));
+        assert!(prompt.contains("owned read-only review task"));
         assert!(normalized_prompt.contains("a strict coordinator for coding work"));
+        assert!(
+            normalized_prompt.contains("For bounded coding work, use an available `implementation_primary` teammate")
+        );
+        assert!(normalized_prompt.contains("use an available `implementation_escalation` teammate"));
+        assert!(normalized_prompt.contains("`independent_review` is a read-only reviewer lane"));
+        assert!(normalized_prompt.contains("Keep exactly one writable implementation lane active per coding task"));
         assert!(normalized_prompt.contains("`Implement Issue #N`"));
         assert!(normalized_prompt.contains("or equivalent"));
         assert!(normalized_prompt.contains("is a Team orchestration request"));
