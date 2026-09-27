@@ -196,17 +196,7 @@ async fn discover_issue_worktree(root: &Path, issue: u64) -> Result<Option<(Stri
         .filter(|branch| issue_branch_matches(branch, issue))
         .map(str::to_owned)
         .collect();
-    let remote_output = git_text(
-        root,
-        ["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"],
-    )
-    .await?;
-    let remote_branches: std::collections::BTreeSet<_> = remote_output
-        .lines()
-        .map(str::trim)
-        .filter(|branch| !branch.is_empty() && *branch != "HEAD" && issue_branch_matches(branch, issue))
-        .map(str::to_owned)
-        .collect();
+    let remote_branches = live_issue_branches(root, issue).await?;
     let associated: Vec<_> = worktrees
         .iter()
         .filter_map(|worktree| {
@@ -252,6 +242,27 @@ async fn discover_issue_worktree(root: &Path, issue: u64) -> Result<Option<(Stri
     }
 }
 
+async fn live_issue_branches(root: &Path, issue: u64) -> Result<std::collections::BTreeSet<String>, TeamError> {
+    let output = fresh_run_workspace::git_network_output(root, ["ls-remote", "origin", "refs/heads/*"]).await;
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            return reject(
+                "remote_state_unavailable",
+                "could not verify live origin Issue branch state",
+            );
+        }
+    };
+    let refs = String::from_utf8_lossy(&output.stdout);
+    Ok(refs
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, reference)| reference))
+        .filter_map(|reference| reference.strip_prefix("refs/heads/"))
+        .filter(|branch| issue_branch_matches(branch, issue))
+        .map(str::to_owned)
+        .collect())
+}
+
 fn parse_worktrees(output: &str) -> Vec<WorktreeEntry> {
     let mut entries = Vec::new();
     let mut path = None;
@@ -282,9 +293,11 @@ fn parse_worktrees(output: &str) -> Vec<WorktreeEntry> {
 fn issue_branch_matches(branch: &str, issue: u64) -> bool {
     let expected = issue.to_string();
     branch.split('/').any(|component| {
-        component
-            .strip_prefix("issue-")
-            .is_some_and(|suffix| suffix == expected || suffix.starts_with(&format!("{expected}-")))
+        component == expected
+            || component.starts_with(&format!("{expected}-"))
+            || component
+                .strip_prefix("issue-")
+                .is_some_and(|suffix| suffix == expected || suffix.starts_with(&format!("{expected}-")))
     })
 }
 
@@ -761,6 +774,21 @@ mod tests {
         assert!(validate_repository_identity("R3PORTME/").is_err());
     }
 
+    #[test]
+    fn issue_branch_matching_accepts_repository_number_conventions_without_prefix_collisions() {
+        for branch in [
+            "docs/125-repository-hygiene",
+            "feat/125-new-workflow",
+            "docs/125",
+            "feat/issue-125-repository-hygiene",
+        ] {
+            assert!(issue_branch_matches(branch, 125), "{branch}");
+        }
+        for branch in ["docs/1250-repository-hygiene", "feat/issue-1250-workflow", "docs/12-5"] {
+            assert!(!issue_branch_matches(branch, 125), "{branch}");
+        }
+    }
+
     #[tokio::test]
     async fn resolves_one_repository_from_persisted_workspace_and_ignores_its_directory_name() {
         let fixture = RepoFixture::new("AionCore").await;
@@ -913,6 +941,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_live_remote_only_repository_convention_issue_branch() {
+        let fixture = RepoFixture::new("AionCore").await;
+        git(
+            &fixture.root,
+            [
+                "push",
+                "--quiet",
+                "origin",
+                "HEAD:refs/heads/docs/21-repository-hygiene",
+            ],
+        );
+
+        let error = fixture
+            .prepare("AionCore", 21, Some("feat/team-fresh-run"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("issue_worktree_conflict"));
+        assert!(
+            git(
+                &fixture.root,
+                ["for-each-ref", "--format=%(refname:short)", "refs/heads"]
+            )
+            .lines()
+            .all(|branch| branch != "docs/21-repository-hygiene"),
+            "remote-only Issue branch must not be duplicated locally"
+        );
+    }
+
+    #[tokio::test]
     async fn refreshes_a_stale_base_before_pinning_the_worktree() {
         let fixture = RepoFixture::new("AionCore").await;
         fixture.publish_commit("advanced.txt", "advanced\n");
@@ -970,14 +1027,11 @@ mod tests {
         );
         git(&issue_branch.root, ["switch", "--quiet", "feat/team-fresh-run"]);
         git(&issue_branch.root, ["branch", "-D", "temporary-issue-candidate"]);
-        assert!(
-            issue_branch
-                .prepare("AionCore", 21, Some("feat/team-fresh-run"))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("worktree_history_unexpected")
-        );
+        let error = issue_branch
+            .prepare("AionCore", 21, Some("feat/team-fresh-run"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("worktree_history_unexpected"), "{error}");
     }
 
     #[tokio::test]
