@@ -68,6 +68,21 @@ impl IProjectStore for SqliteProjectStore {
         Ok(row)
     }
 
+    async fn list_workspace_folders(&self, user_id: &str) -> Result<Vec<FolderRow>, DbError> {
+        let rows = sqlx::query_as::<_, FolderRow>(
+            "SELECT DISTINCT f.folder_id, f.resource_uri, f.resource_canonical, f.created_at, f.updated_at \
+             FROM project_explorer pe \
+             JOIN projects p ON p.project_id = pe.project_id \
+             JOIN folders f ON f.folder_id = pe.folder_id \
+             WHERE pe.owner_user_id = ? AND pe.role = 'workspace' AND p.kind = 'standard' \
+             ORDER BY f.folder_id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn select_workspace_entry_by_folder(
         &self,
         user_id: &str,

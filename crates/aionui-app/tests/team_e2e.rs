@@ -2245,6 +2245,213 @@ async fn fresh_run_admits_current_and_behind_git_workspaces_preserving_team_conf
     );
 }
 
+struct IssueRepositoryFixture {
+    _temp: tempfile::TempDir,
+    repositories: Vec<(String, std::path::PathBuf)>,
+}
+
+async fn issue_repository_fixture() -> IssueRepositoryFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let mut repositories = Vec::new();
+    for name in ["AionCore", "AionUi"] {
+        let remote = temp.path().join(format!("remotes/R3PORTME/{name}.git"));
+        let workspace = temp.path().join(format!("checkouts/{name}-with-arbitrary-name"));
+        std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        fresh_run_git(
+            temp.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=feat/team-fresh-run",
+                remote.to_str().unwrap(),
+            ],
+        )
+        .await;
+        fresh_run_git(&workspace, &["init", "--quiet", "--initial-branch=feat/team-fresh-run"]).await;
+        fresh_run_git(&workspace, &["config", "user.name", "Issue Workspace E2E"]).await;
+        fresh_run_git(&workspace, &["config", "user.email", "issue-workspace@example.invalid"]).await;
+        fresh_run_git(&workspace, &["remote", "add", "origin", remote.to_str().unwrap()]).await;
+        fresh_run_git(
+            &workspace,
+            &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+        )
+        .await;
+        std::fs::write(workspace.join("tracked.txt"), "initial\n").unwrap();
+        fresh_run_git(&workspace, &["add", "tracked.txt"]).await;
+        fresh_run_git(&workspace, &["commit", "--quiet", "-m", "initial base"]).await;
+        fresh_run_git(
+            &workspace,
+            &["push", "--quiet", "--set-upstream", "origin", "feat/team-fresh-run"],
+        )
+        .await;
+        fresh_run_git(&workspace, &["remote", "set-head", "origin", "feat/team-fresh-run"]).await;
+        repositories.push((format!("R3PORTME/{name}"), workspace));
+    }
+    IssueRepositoryFixture {
+        _temp: temp,
+        repositories,
+    }
+}
+
+#[tokio::test]
+async fn fresh_run_issue_switches_repositories_and_preserves_roster_and_pre_admission_state() {
+    let fixture = issue_repository_fixture().await;
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let user = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    for (_, workspace) in &fixture.repositories {
+        services
+            .project_service
+            .create_standard(&user.id, aionui_project::canonical::to_file_uri(workspace).unwrap())
+            .await
+            .unwrap();
+    }
+    let team = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = team["id"].as_str().unwrap();
+    let initial_agents = team["assistants"].as_array().unwrap().clone();
+    let expected_routing: Vec<_> = initial_agents
+        .iter()
+        .map(|agent| {
+            (
+                agent["slot_id"].clone(),
+                agent["role"].clone(),
+                agent["model"].clone(),
+                agent["routing"].clone(),
+            )
+        })
+        .collect();
+    let mut final_workspace = String::new();
+
+    for (issue, (repository, _)) in fixture.repositories.iter().enumerate() {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &format!("/api/teams/{team_id}/fresh-run-issue"),
+                json!({
+                    "repository_full_name": repository,
+                    "issue_number": 21 + issue as u64,
+                    "base_ref": "feat/team-fresh-run"
+                }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = body_json(response).await;
+        assert_eq!(response["data"]["repository_full_name"], repository.as_str());
+        assert_eq!(response["data"]["base_ref"], "feat/team-fresh-run");
+        assert_eq!(
+            response["data"]["branch"],
+            format!("feat/issue-{}-repository-issue-workspaces", 21 + issue)
+        );
+        let head = fresh_run_git(
+            std::path::Path::new(response["data"]["workspace"].as_str().unwrap()),
+            &["rev-parse", "HEAD"],
+        )
+        .await;
+        assert_eq!(response["data"]["base_sha"], head);
+        assert_eq!(response["data"]["head_sha"], head);
+        final_workspace = response["data"]["workspace"].as_str().unwrap().to_owned();
+    }
+
+    let current = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    let current = body_json(current).await["data"].clone();
+    assert_eq!(current["workspace"], final_workspace);
+    let actual_routing: Vec<_> = current["assistants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| {
+            (
+                agent["slot_id"].clone(),
+                agent["role"].clone(),
+                agent["model"].clone(),
+                agent["routing"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(actual_routing, expected_routing);
+
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('issue-admission-message', ?, ?, 'lead-slot', 'message', 'preserve on failure', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(current["assistants"][1]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('issue-admission-task', ?, 'Preserve', 'Pre-admission failure', 'completed', ?, '[]', '[]', '{}', 10, 20)",
+    )
+    .bind(team_id)
+    .bind(current["assistants"][0]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    let previous_conversations: Vec<_> = current["assistants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| agent["conversation_id"].clone())
+        .collect();
+
+    let rejected = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run-issue"),
+            json!({
+                "repository_full_name": "R3PORTME/Unknown",
+                "issue_number": 99,
+                "base_ref": "feat/team-fresh-run"
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let unchanged = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let unchanged = body_json(unchanged).await["data"].clone();
+    assert_eq!(unchanged["workspace"], current["workspace"]);
+    assert_eq!(
+        unchanged["assistants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["conversation_id"].clone())
+            .collect::<Vec<_>>(),
+        previous_conversations
+    );
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE id = 'issue-admission-message'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE id = 'issue-admission-task'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(mailbox_count, 1);
+    assert_eq!(task_count, 1);
+}
+
 #[tokio::test]
 async fn fresh_run_rejects_behind_git_workspace_during_active_run_without_partial_reset() {
     let (mut app, services) = build_app_with_mock_agents().await;
