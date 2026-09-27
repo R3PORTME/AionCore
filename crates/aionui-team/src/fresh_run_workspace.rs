@@ -1,5 +1,6 @@
 //! Git workspace freshness admission for Team fresh-run.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use aionui_runtime::Builder;
@@ -10,6 +11,14 @@ use crate::error::TeamError;
 /// Ensure a Git-backed workspace is current before fresh-run mutates Team state.
 /// Non-Git workspaces retain the existing fresh-run behavior.
 pub(crate) async fn ensure_fresh(workspace: &str) -> Result<(), TeamError> {
+    ensure_fresh_with_refresh_hook(workspace, || async {}).await
+}
+
+async fn ensure_fresh_with_refresh_hook<F, Fut>(workspace: &str, after_refresh: F) -> Result<(), TeamError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
     let root = match git_root(workspace).await? {
         None => return Ok(()),
         Some(root) => root,
@@ -73,6 +82,8 @@ pub(crate) async fn ensure_fresh(workspace: &str) -> Result<(), TeamError> {
             );
         }
     }
+
+    after_refresh().await;
 
     // Re-establish the checkout identity after fetch, since fetch and other Git
     // clients can run concurrently with this admission check.
@@ -453,6 +464,20 @@ mod tests {
         let untracked = TestRepo::new().await;
         assert_git(&untracked.root, ["branch", "--unset-upstream"]).await;
         assert!(ensure_fresh(untracked.root.to_str().unwrap()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn upstream_identity_change_during_refresh_fails_closed() {
+        let repo = TestRepo::new().await;
+        let before = repo.head().await;
+        let error = ensure_fresh_with_refresh_hook(repo.root.to_str().unwrap(), || async {
+            assert_git(&repo.root, ["update-ref", "refs/remotes/origin/alternate", &before]).await;
+            assert_git(&repo.root, ["branch", "--set-upstream-to=origin/alternate", "main"]).await;
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(repo.head().await, before);
     }
 
     #[tokio::test]
