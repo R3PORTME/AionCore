@@ -2111,6 +2111,234 @@ async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
     let _ = std::fs::remove_dir_all(workspace);
 }
 
+struct GitFreshRunFixture {
+    _remote: tempfile::TempDir,
+    remote_path: std::path::PathBuf,
+    workspace: tempfile::TempDir,
+}
+
+async fn fresh_run_git(cwd: &std::path::Path, args: &[&str]) -> String {
+    let mut command = aionui_runtime::Builder::clean_cli("git");
+    command.args(args).current_dir(cwd).env("LC_ALL", "C");
+    let output = command.output().await.expect("run Git fixture command");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+async fn fresh_run_git_fixture() -> GitFreshRunFixture {
+    let remote = tempfile::TempDir::new().unwrap();
+    let remote_path = remote.path().join("remote.git");
+    let remote_path_string = remote_path.to_string_lossy().to_string();
+    let mut command = aionui_runtime::Builder::clean_cli("git");
+    command.args([
+        "init",
+        "--bare",
+        "--quiet",
+        "--initial-branch=main",
+        &remote_path_string,
+    ]);
+    let output = command.output().await.expect("initialize fresh-run bare remote");
+    assert!(output.status.success());
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    fresh_run_git(workspace.path(), &["init", "--quiet", "--initial-branch=main"]).await;
+    fresh_run_git(workspace.path(), &["config", "user.name", "Fresh Run Test"]).await;
+    fresh_run_git(workspace.path(), &["config", "user.email", "fresh-run@example.invalid"]).await;
+    fresh_run_git(workspace.path(), &["remote", "add", "origin", &remote_path_string]).await;
+    std::fs::write(workspace.path().join("tracked.txt"), "initial\n").unwrap();
+    fresh_run_git(workspace.path(), &["add", "tracked.txt"]).await;
+    fresh_run_git(workspace.path(), &["commit", "--quiet", "-m", "initial"]).await;
+    fresh_run_git(
+        workspace.path(),
+        &["push", "--quiet", "--set-upstream", "origin", "main"],
+    )
+    .await;
+
+    GitFreshRunFixture {
+        _remote: remote,
+        remote_path,
+        workspace,
+    }
+}
+
+async fn publish_fresh_run_change(fixture: &GitFreshRunFixture, content: &str) -> String {
+    let publisher = tempfile::TempDir::new().unwrap();
+    let remote_path = fixture.remote_path.to_string_lossy().to_string();
+    fresh_run_git(publisher.path(), &["clone", "--quiet", &remote_path, "."]).await;
+    fresh_run_git(publisher.path(), &["config", "user.name", "Fresh Run Test"]).await;
+    fresh_run_git(publisher.path(), &["config", "user.email", "fresh-run@example.invalid"]).await;
+    std::fs::write(publisher.path().join("tracked.txt"), content).unwrap();
+    fresh_run_git(publisher.path(), &["add", "tracked.txt"]).await;
+    fresh_run_git(publisher.path(), &["commit", "--quiet", "-m", "publish change"]).await;
+    fresh_run_git(publisher.path(), &["push", "--quiet", "origin", "main"]).await;
+    fresh_run_git(publisher.path(), &["rev-parse", "HEAD"]).await
+}
+
+#[tokio::test]
+async fn fresh_run_admits_current_and_behind_git_workspaces_preserving_team_configuration() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let before_agents = data["assistants"].as_array().unwrap().clone();
+    let fixture = fresh_run_git_fixture().await;
+    let workspace = fixture.workspace.path().to_string_lossy().to_string();
+    let initial_head = fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await;
+
+    let current = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({ "workspace": workspace }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        initial_head
+    );
+    let advanced_head = publish_fresh_run_change(&fixture, "advanced\n").await;
+    let behind = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({ "workspace": workspace }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(behind.status(), StatusCode::OK);
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        advanced_head
+    );
+
+    {
+        let team = app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+            .await
+            .unwrap();
+        assert_eq!(team.status(), StatusCode::OK);
+        let team = body_json(team).await["data"].clone();
+        assert_eq!(team["workspace"], workspace);
+        assert_eq!(team["assistants"].as_array().unwrap().len(), before_agents.len());
+        for (actual, original) in team["assistants"].as_array().unwrap().iter().zip(&before_agents) {
+            for field in ["slot_id", "role", "assistant_id", "model", "routing"] {
+                assert_eq!(actual[field], original[field], "fresh-run changed {field}");
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap(),
+        "advanced\n"
+    );
+}
+
+#[tokio::test]
+async fn fresh_run_rejects_behind_git_workspace_during_active_run_without_partial_reset() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let original_agents = data["assistants"].as_array().unwrap().clone();
+    let fixture = fresh_run_git_fixture().await;
+    let original_head = fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await;
+    let original_content = std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap();
+    let _published = publish_fresh_run_change(&fixture, "must-not-be-checked-out\n").await;
+
+    let send = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/messages"),
+            json!({ "content": "active run", "files": [] }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(send.status(), StatusCode::OK);
+    let active_run_id = body_json(send).await["data"]["run"]["team_run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({ "workspace": fixture.workspace.path().to_string_lossy() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"].as_str().unwrap().to_owned();
+    assert!(
+        error.contains("active_run"),
+        "expected active_run rejection, got {error}"
+    );
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        original_head
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap(),
+        original_content
+    );
+
+    let team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let team = body_json(team).await["data"].clone();
+    for (actual, original) in team["assistants"].as_array().unwrap().iter().zip(&original_agents) {
+        assert_eq!(actual["slot_id"], original["slot_id"]);
+        assert_eq!(actual["conversation_id"], original["conversation_id"]);
+        assert_eq!(actual["routing"], original["routing"]);
+    }
+    let run_after = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}/run-state"), &token))
+        .await
+        .unwrap();
+    let run_after = body_json(run_after).await["data"]["active_run"].clone();
+    assert!(
+        run_after.is_null() || run_after["team_run_id"] == active_run_id,
+        "fresh-run changed an unrelated active run: {run_after}"
+    );
+
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        mailbox_count, 1,
+        "rejected fresh-run must preserve the active run's mailbox item"
+    );
+    assert_eq!(task_count, 0);
+}
+
 #[tokio::test]
 async fn fresh_run_rejects_git_workspace_before_team_state_is_reset() {
     let (mut app, services) = build_app_with_mock_agents().await;
@@ -2180,6 +2408,11 @@ async fn fresh_run_rejects_git_workspace_before_team_state_is_reset() {
     );
     let response = app.clone().oneshot(fresh).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"].as_str().unwrap().to_owned();
+    assert!(
+        error.contains("missing_upstream"),
+        "expected missing_upstream rejection, got {error}"
+    );
 
     let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
         .bind(team_id)
@@ -2204,6 +2437,42 @@ async fn fresh_run_rejects_git_workspace_before_team_state_is_reset() {
     assert_eq!(team["data"]["workspace"], original_workspace);
     assert_eq!(team["data"]["assistants"][0]["conversation_id"], lead_id);
     assert_eq!(team["data"]["assistants"][1]["conversation_id"], worker_id);
+}
+
+#[tokio::test]
+async fn fresh_run_rejects_missing_team_before_git_workspace_mutation() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let fixture = fresh_run_git_fixture().await;
+    let original_head = fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await;
+    let original_content = std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap();
+    let _published = publish_fresh_run_change(&fixture, "must-remain-unchecked-out\n").await;
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams/nonexistent/fresh-run",
+            json!({ "workspace": fixture.workspace.path().to_string_lossy() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        original_head
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap(),
+        original_content
+    );
+    let team_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(team_count, 0);
 }
 
 #[tokio::test]

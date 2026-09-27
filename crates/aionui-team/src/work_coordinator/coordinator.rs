@@ -117,6 +117,34 @@ pub(crate) struct SlotWorkCoordinator {
     pub(super) state: Mutex<CoordinatorState>,
 }
 
+pub(crate) struct FreshRunQuiesceGuard<'a> {
+    coordinator: &'a SlotWorkCoordinator,
+    previous_constraints: Vec<(String, RuntimeConstraint)>,
+    committed: bool,
+}
+
+impl FreshRunQuiesceGuard<'_> {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for FreshRunQuiesceGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = self.coordinator.lock_state();
+        for (slot_id, previous) in &self.previous_constraints {
+            if let Some(slot) = state.slots.get_mut(slot_id)
+                && matches!(slot.runtime_constraint, RuntimeConstraint::SessionStopped)
+            {
+                slot.runtime_constraint = previous.clone();
+            }
+        }
+    }
+}
+
 impl SlotWorkCoordinator {
     pub(crate) fn new(team_id: String, session_generation: String, run_causality: Arc<dyn RunCausalityPort>) -> Self {
         Self {
@@ -1545,7 +1573,7 @@ impl SlotWorkCoordinator {
     /// as acquire_enqueue(), so either an enqueue lease/work intent wins and
     /// fresh-run is rejected, or fresh-run wins and all later user/agent/system
     /// enqueues are rejected until the TeamSession is rebuilt.
-    pub(crate) fn quiesce_for_fresh_run(&self) -> Result<(), TeamError> {
+    pub(crate) fn quiesce_for_fresh_run(&self) -> Result<FreshRunQuiesceGuard<'_>, TeamError> {
         let mut state = self.lock_state();
         let has_work = !state.enqueue_leases.is_empty()
             || state.intents.values().any(|intent| !intent.state.is_terminal())
@@ -1557,14 +1585,24 @@ impl SlotWorkCoordinator {
             });
         if has_work {
             return Err(TeamError::InvalidRequest(
-                "team has active or pending work; finish or cancel it before starting a fresh run".to_owned(),
+                "fresh_run_rejected (active_or_pending_work): finish or cancel pending work before starting a fresh run"
+                    .to_owned(),
             ));
         }
 
+        let previous_constraints = state
+            .slots
+            .iter()
+            .map(|(slot_id, slot)| (slot_id.clone(), slot.runtime_constraint.clone()))
+            .collect();
         for slot in state.slots.values_mut() {
             slot.runtime_constraint = RuntimeConstraint::SessionStopped;
         }
-        Ok(())
+        Ok(FreshRunQuiesceGuard {
+            coordinator: self,
+            previous_constraints,
+            committed: false,
+        })
     }
 
     pub(crate) fn stop(&self) -> Vec<RunWorkSummary> {

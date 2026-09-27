@@ -110,7 +110,7 @@ fn fresh_run_quiesce_blocks_new_enqueue_when_idle() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
 
-    coordinator.quiesce_for_fresh_run().unwrap();
+    let quiesced = coordinator.quiesce_for_fresh_run().unwrap();
 
     let error = coordinator
         .acquire_enqueue(EnqueueRequest {
@@ -121,6 +121,28 @@ fn fresh_run_quiesce_blocks_new_enqueue_when_idle() {
         })
         .unwrap_err();
     assert!(error.to_string().contains("session stopped"));
+    quiesced.commit();
+}
+
+#[test]
+fn fresh_run_quiesce_rolls_back_runtime_constraint_when_admission_aborts() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+
+    let guard = coordinator.quiesce_for_fresh_run().unwrap();
+    drop(guard);
+
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .expect("an aborted fresh-run admission must restore the prior Ready constraint");
+    coordinator
+        .commit_enqueue(&lease, Some("message-after-abort".into()))
+        .unwrap();
 }
 
 #[test]
@@ -136,8 +158,11 @@ fn fresh_run_quiesce_rejects_pending_enqueue_lease_without_mutating_slot() {
         })
         .unwrap();
 
-    let error = coordinator.quiesce_for_fresh_run().unwrap_err();
-    assert!(error.to_string().contains("active or pending work"));
+    let error = match coordinator.quiesce_for_fresh_run() {
+        Ok(_) => panic!("active work must reject fresh-run quiescence"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("active_or_pending_work"));
 
     let committed = coordinator
         .commit_enqueue(&lease, Some("user-message-1".into()))
