@@ -2344,10 +2344,7 @@ async fn fresh_run_issue_switches_repositories_and_preserves_roster_and_pre_admi
         let response = body_json(response).await;
         assert_eq!(response["data"]["repository_full_name"], repository.as_str());
         assert_eq!(response["data"]["base_ref"], "feat/team-fresh-run");
-        assert_eq!(
-            response["data"]["branch"],
-            format!("feat/issue-{}-repository-issue-workspaces", 21 + issue)
-        );
+        assert_eq!(response["data"]["branch"], format!("feat/issue-{}", 21 + issue));
         let head = fresh_run_git(
             std::path::Path::new(response["data"]["workspace"].as_str().unwrap()),
             &["rev-parse", "HEAD"],
@@ -2450,6 +2447,87 @@ async fn fresh_run_issue_switches_repositories_and_preserves_roster_and_pre_admi
         .unwrap();
     assert_eq!(mailbox_count, 1);
     assert_eq!(task_count, 1);
+}
+
+#[tokio::test]
+async fn fresh_run_issue_resolves_registered_linked_worktrees_as_one_repository() {
+    let fixture = issue_repository_fixture().await;
+    let (repository, main_workspace) = &fixture.repositories[0];
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let user = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    services
+        .project_service
+        .create_standard(
+            &user.id,
+            aionui_project::canonical::to_file_uri(main_workspace).unwrap(),
+        )
+        .await
+        .unwrap();
+    let team = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = team["id"].as_str().unwrap();
+
+    let first = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run-issue"),
+            json!({
+                "repository_full_name": repository,
+                "issue_number": 21,
+                "base_ref": "feat/team-fresh-run"
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_json(first).await;
+    assert_eq!(first["data"]["branch"], "feat/issue-21");
+    let first_workspace = std::path::PathBuf::from(first["data"]["workspace"].as_str().unwrap());
+    assert_ne!(first_workspace, *main_workspace);
+
+    // Registering the first Issue worktree simulates a Project Explorer root
+    // learned between two Issue requests. Its git-common-dir must deduplicate
+    // it with the already registered repository root.
+    services
+        .project_service
+        .create_standard(
+            &user.id,
+            aionui_project::canonical::to_file_uri(&first_workspace).unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run-issue"),
+            json!({
+                "repository_full_name": repository,
+                "issue_number": 22,
+                "base_ref": "feat/team-fresh-run"
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_json(second).await;
+    assert_eq!(second["data"]["branch"], "feat/issue-22");
+    assert_ne!(second["data"]["workspace"], first_workspace.to_string_lossy().as_ref());
+    assert_eq!(second["data"]["base_sha"], second["data"]["head_sha"]);
+    let current = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(current).await["data"]["workspace"],
+        second["data"]["workspace"]
+    );
 }
 
 #[tokio::test]

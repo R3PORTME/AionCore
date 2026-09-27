@@ -26,7 +26,7 @@ pub(crate) async fn prepare(
     issue_number: u64,
     requested_base: Option<&str>,
 ) -> Result<PreparedIssueWorkspace, TeamError> {
-    let (owner, repository) = validate_repository_identity(repository_full_name)?;
+    validate_repository_identity(repository_full_name)?;
     if issue_number == 0 {
         return reject("invalid_issue", "Issue number must be greater than zero");
     }
@@ -45,8 +45,13 @@ pub(crate) async fn prepare(
     };
     let base_ref = resolve_base_ref(&root, requested_base).await?;
     let base_sha = refresh_and_pin_base(&root, &base_ref).await?;
-    let branch = format!("feat/issue-{issue_number}-repository-issue-workspaces");
-    let worktree = issue_worktree_path(&root, owner, repository, issue_number);
+    let (branch, worktree) = match discover_issue_worktree(&root, issue_number).await? {
+        Some((branch, worktree)) => (branch, worktree),
+        None => (
+            format!("feat/issue-{issue_number}"),
+            issue_worktree_path(&root, issue_number),
+        ),
+    };
     let reused = prepare_worktree(&root, &worktree, &branch, &base_ref, &base_sha).await?;
 
     verify_repository_identity(&root, &remote_urls, repository_full_name).await?;
@@ -94,20 +99,18 @@ fn validate_repository_identity(value: &str) -> Result<(&str, &str), TeamError> 
 }
 
 async fn resolve_repository(known_paths: Vec<PathBuf>, requested: &str) -> Result<(PathBuf, Vec<String>), TeamError> {
-    let mut matches: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut roots = std::collections::BTreeSet::new();
     for known_path in known_paths {
-        let root_output = match fresh_run_workspace::git_output(&known_path, ["rev-parse", "--show-toplevel"]).await {
-            Ok(output) if output.status.success() => output,
-            _ => continue,
-        };
-        let root = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
-        let canonical_root = match std::fs::canonicalize(&root) {
-            Ok(path) => path,
+        let root = match main_worktree_root(&known_path).await {
+            Ok(Some(root)) => root,
+            Ok(None) => continue,
             Err(_) => continue,
         };
-        if matches.iter().any(|(existing, _)| existing == &canonical_root) {
-            continue;
-        }
+        roots.insert(root);
+    }
+
+    let mut matches: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for canonical_root in roots {
         let output =
             match fresh_run_workspace::git_output(&canonical_root, ["remote", "get-url", "--all", "origin"]).await {
                 Ok(output) if output.status.success() => output,
@@ -135,6 +138,154 @@ async fn resolve_repository(known_paths: Vec<PathBuf>, requested: &str) -> Resul
             "multiple known local repositories match the requested identity",
         ),
     }
+}
+
+/// Resolve any registered worktree to the main worktree for its shared Git
+/// repository. The common directory is Git-owned identity; its parent is the
+/// primary worktree only when Git confirms that it contains the repository's
+/// `.git` directory and resolves back to the same common directory.
+async fn main_worktree_root(known_path: &Path) -> Result<Option<PathBuf>, TeamError> {
+    let common = match git_text(known_path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).await {
+        Ok(common) => common,
+        Err(_) => return Ok(None),
+    };
+    let common = match std::fs::canonicalize(common) {
+        Ok(common) => common,
+        Err(_) => return Ok(None),
+    };
+    if common.file_name().is_none_or(|name| name != ".git") {
+        return Ok(None);
+    }
+    let Some(candidate) = common.parent() else {
+        return Ok(None);
+    };
+    if !candidate.join(".git").is_dir() {
+        return Ok(None);
+    }
+    let root = match std::fs::canonicalize(candidate) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let top = match git_text(&root, ["rev-parse", "--show-toplevel"]).await {
+        Ok(top) => top,
+        Err(_) => return Ok(None),
+    };
+    let resolved_common = match git_text(&root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).await {
+        Ok(common) => common,
+        Err(_) => return Ok(None),
+    };
+    if Path::new(&top) != root || std::fs::canonicalize(resolved_common).ok().as_deref() != Some(&common) {
+        return Ok(None);
+    }
+    Ok(Some(root))
+}
+
+#[derive(Debug)]
+struct WorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+async fn discover_issue_worktree(root: &Path, issue: u64) -> Result<Option<(String, PathBuf)>, TeamError> {
+    let worktree_output = git_text(root, ["worktree", "list", "--porcelain"]).await?;
+    let worktrees = parse_worktrees(&worktree_output);
+    let local_output = git_text(root, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]).await?;
+    let local_branches: std::collections::BTreeSet<_> = local_output
+        .lines()
+        .map(str::trim)
+        .filter(|branch| issue_branch_matches(branch, issue))
+        .map(str::to_owned)
+        .collect();
+    let remote_output = git_text(
+        root,
+        ["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"],
+    )
+    .await?;
+    let remote_branches: std::collections::BTreeSet<_> = remote_output
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty() && *branch != "HEAD" && issue_branch_matches(branch, issue))
+        .map(str::to_owned)
+        .collect();
+    let associated: Vec<_> = worktrees
+        .iter()
+        .filter_map(|worktree| {
+            worktree
+                .branch
+                .as_deref()
+                .filter(|branch| issue_branch_matches(branch, issue))
+                .map(|branch| (branch.to_owned(), worktree.path.clone()))
+        })
+        .collect();
+
+    if associated.len() > 1 || local_branches.len() > 1 {
+        return reject(
+            "issue_worktree_ambiguous",
+            "multiple local Issue branch or worktree associations match this Issue",
+        );
+    }
+    match (associated.first(), local_branches.iter().next()) {
+        (Some((branch, path)), Some(local_branch)) if branch == local_branch => {
+            if path == root {
+                return reject(
+                    "issue_worktree_conflict",
+                    "the matching Issue branch is checked out in the main worktree, not an isolated worktree",
+                );
+            }
+            if remote_branches.iter().any(|remote| remote != branch) {
+                return reject(
+                    "issue_worktree_ambiguous",
+                    "a conflicting remote Issue branch also matches this Issue",
+                );
+            }
+            Ok(Some((branch.clone(), path.clone())))
+        }
+        (None, None) if remote_branches.is_empty() => Ok(None),
+        (None, None) => reject(
+            "issue_worktree_conflict",
+            "a remote Issue branch exists without a verified local worktree association",
+        ),
+        _ => reject(
+            "issue_worktree_conflict",
+            "Issue branch refs and worktree metadata do not identify one exact safe association",
+        ),
+    }
+}
+
+fn parse_worktrees(output: &str) -> Vec<WorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut path = None;
+    let mut branch = None;
+    let flush = |entries: &mut Vec<WorktreeEntry>, path: &mut Option<PathBuf>, branch: &mut Option<String>| {
+        if let Some(path) = path.take() {
+            entries.push(WorktreeEntry {
+                path,
+                branch: branch.take(),
+            });
+        } else {
+            branch.take();
+        }
+    };
+    for line in output.lines() {
+        if line.is_empty() {
+            flush(&mut entries, &mut path, &mut branch);
+        } else if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(value));
+        } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(value.to_owned());
+        }
+    }
+    flush(&mut entries, &mut path, &mut branch);
+    entries
+}
+
+fn issue_branch_matches(branch: &str, issue: u64) -> bool {
+    let expected = issue.to_string();
+    branch.split('/').any(|component| {
+        component
+            .strip_prefix("issue-")
+            .is_some_and(|suffix| suffix == expected || suffix.starts_with(&format!("{expected}-")))
+    })
 }
 
 fn remote_matches_repository(remote: &str, requested: &str) -> bool {
@@ -456,10 +607,11 @@ where
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn issue_worktree_path(root: &Path, owner: &str, repository: &str, issue: u64) -> PathBuf {
-    root.parent()
-        .unwrap_or(root)
-        .join(format!("{owner}-{repository}-ISSUE-{issue}"))
+fn issue_worktree_path(root: &Path, issue: u64) -> PathBuf {
+    root.parent().unwrap_or(root).join(format!(
+        "{}-ISSUE-{issue}",
+        root.file_name().unwrap_or_default().to_string_lossy()
+    ))
 }
 
 fn reject<T>(reason: &'static str, message: &'static str) -> Result<T, TeamError> {
@@ -617,10 +769,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.repository_full_name, "R3PORTME/AionCore");
-        assert_eq!(
-            Path::new(&prepared.workspace).file_name().unwrap(),
-            "R3PORTME-AionCore-ISSUE-21"
-        );
+        assert_eq!(Path::new(&prepared.workspace), issue_worktree_path(&fixture.root, 21));
+        assert_eq!(prepared.branch, "feat/issue-21");
         assert_eq!(prepared.base_ref, "feat/team-fresh-run");
         assert!(!prepared.reused);
     }
@@ -669,6 +819,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("repository_ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn linked_project_worktrees_resolve_to_one_main_repository_root() {
+        let fixture = RepoFixture::new("AionCore").await;
+        let linked = fixture._temp.path().join("registered-linked-worktree");
+        git(
+            &fixture.root,
+            [
+                "worktree",
+                "add",
+                "--quiet",
+                "--track",
+                "-b",
+                "feat/linked-workspace",
+                linked.to_str().unwrap(),
+                "refs/remotes/origin/feat/team-fresh-run",
+            ],
+        );
+        fixture
+            .projects
+            .create_standard("system_default_user", to_file_uri(&linked).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(main_worktree_root(&linked).await.unwrap().unwrap(), fixture.root);
+        let (resolved, _) = resolve_repository(vec![fixture.root.clone(), linked], "R3PORTME/AionCore")
+            .await
+            .unwrap();
+        assert_eq!(resolved, fixture.root);
+    }
+
+    #[tokio::test]
+    async fn reuses_a_convention_compliant_issue_worktree_from_git_metadata() {
+        let fixture = RepoFixture::new("AionCore").await;
+        let existing = fixture._temp.path().join("custom-location/issue 21 checkout");
+        git(
+            &fixture.root,
+            [
+                "worktree",
+                "add",
+                "--quiet",
+                "--track",
+                "-b",
+                "fix/issue-21-existing-convention-slug",
+                existing.to_str().unwrap(),
+                "refs/remotes/origin/feat/team-fresh-run",
+            ],
+        );
+        fixture
+            .projects
+            .create_standard("system_default_user", to_file_uri(&existing).unwrap())
+            .await
+            .unwrap();
+
+        let prepared = fixture
+            .prepare("AionCore", 21, Some("feat/team-fresh-run"))
+            .await
+            .unwrap();
+        assert!(prepared.reused);
+        assert_eq!(prepared.branch, "fix/issue-21-existing-convention-slug");
+        assert_eq!(Path::new(&prepared.workspace), existing);
+    }
+
+    #[tokio::test]
+    async fn rejects_multiple_issue_worktree_associations() {
+        let fixture = RepoFixture::new("AionCore").await;
+        for (branch, directory) in [
+            ("feat/issue-21-first", "issue-21-first"),
+            ("fix/issue-21-second", "issue-21-second"),
+        ] {
+            let worktree = fixture._temp.path().join(directory);
+            git(
+                &fixture.root,
+                [
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--track",
+                    "-b",
+                    branch,
+                    worktree.to_str().unwrap(),
+                    "refs/remotes/origin/feat/team-fresh-run",
+                ],
+            );
+        }
+        let error = fixture
+            .prepare("AionCore", 21, Some("feat/team-fresh-run"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("issue_worktree_ambiguous"));
     }
 
     #[tokio::test]
@@ -725,12 +966,7 @@ mod tests {
         git(&issue_branch.root, ["commit", "--quiet", "-m", "remote issue branch"]);
         git(
             &issue_branch.root,
-            [
-                "push",
-                "--quiet",
-                "origin",
-                "HEAD:refs/heads/feat/issue-21-repository-issue-workspaces",
-            ],
+            ["push", "--quiet", "origin", "HEAD:refs/heads/feat/issue-21"],
         );
         git(&issue_branch.root, ["switch", "--quiet", "feat/team-fresh-run"]);
         git(&issue_branch.root, ["branch", "-D", "temporary-issue-candidate"]);
@@ -775,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_conflicting_dirty_and_unexpected_history_worktrees() {
         let conflict = RepoFixture::new("AionCore").await;
-        let target = issue_worktree_path(&conflict.root, "R3PORTME", "AionCore", 21);
+        let target = issue_worktree_path(&conflict.root, 21);
         std::fs::create_dir_all(&target).unwrap();
         assert!(
             conflict
