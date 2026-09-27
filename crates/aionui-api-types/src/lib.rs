@@ -207,14 +207,15 @@ pub use team::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
     TeamContextResetAvailability, TeamContextResetCapability, TeamContextResetNotice, TeamContextResetResponse,
-    TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunRequest, TeamFreshRunResponse,
-    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamListResponse, TeamMailboxChange, TeamMailboxChangedPayload,
-    TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMcpSelection, TeamMessageEnqueueStatus, TeamQueuedPolicy,
-    TeamResponse, TeamRouting, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
-    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
-    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
-    TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange, TeamTaskChangedPayload, TeamTaskResponse,
-    TeammateMessagePayload, UpdateAgentRoutingRequest, assistant_mcp_binding_fingerprint,
+    TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunIssueRequest, TeamFreshRunIssueResponse,
+    TeamFreshRunRequest, TeamFreshRunResponse, TeamInterruptAgentResponse, TeamInterruptOutcome, TeamListResponse,
+    TeamMailboxChange, TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMcpSelection,
+    TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamResponse, TeamRouting, TeamRunAckResponse, TeamRunPayload,
+    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
+    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange,
+    TeamTaskChangedPayload, TeamTaskResponse, TeammateMessagePayload, UpdateAgentRoutingRequest,
+    assistant_mcp_binding_fingerprint,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

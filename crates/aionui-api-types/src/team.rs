@@ -143,6 +143,16 @@ pub struct TeamFreshRunRequest {
     pub workspace: String,
 }
 
+/// Request body for `POST /api/teams/:id/fresh-run-issue`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamFreshRunIssueRequest {
+    pub repository_full_name: String,
+    pub issue_number: u64,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // B. Agent management — Request DTOs
 // ---------------------------------------------------------------------------
@@ -585,6 +595,21 @@ pub struct TeamContextResetResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamFreshRunResponse {
     pub workspace: String,
+    pub member_count: usize,
+    pub cleared_context_anchors: usize,
+}
+
+/// Result of preparing a verified Issue worktree and fresh-running the Team into it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamFreshRunIssueResponse {
+    pub repository_full_name: String,
+    pub issue_number: u64,
+    pub workspace: String,
+    pub branch: String,
+    pub base_ref: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub reused: bool,
     pub member_count: usize,
     pub cleared_context_anchors: usize,
 }

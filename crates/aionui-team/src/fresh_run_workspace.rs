@@ -28,6 +28,24 @@ pub(crate) enum FreshnessPlan {
     },
 }
 
+/// Issue admission pins a worktree to the exact base SHA it prepared. Reusing
+/// the ordinary freshness path is safe only while both the checkout and its
+/// refreshed upstream still equal that pin.
+pub(crate) fn require_pinned_head(plan: &FreshnessPlan, expected: &str) -> Result<(), TeamError> {
+    match plan {
+        FreshnessPlan::Git {
+            head,
+            target,
+            needs_fast_forward: false,
+            ..
+        } if head == expected && target == expected => Ok(()),
+        _ => Err(TeamError::InvalidRequest(
+            "Issue workspace admission failed (base_changed): prepared workspace no longer matches its pinned base"
+                .to_owned(),
+        )),
+    }
+}
+
 /// Refresh evidence and classify the checkout without changing its worktree.
 /// The caller must finish ownership/work admission before applying a fast-forward.
 pub(crate) async fn inspect(workspace: &str) -> Result<FreshnessPlan, TeamError> {
@@ -260,7 +278,7 @@ fn has_git_metadata(workspace: &Path) -> bool {
     workspace.ancestors().any(|path| path.join(".git").exists())
 }
 
-async fn git_output<I, S>(directory: &Path, args: I) -> std::io::Result<std::process::Output>
+pub(super) async fn git_output<I, S>(directory: &Path, args: I) -> std::io::Result<std::process::Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -291,14 +309,14 @@ fn apply_noninteractive_git_env(command: &mut Builder) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum NetworkCommandError {
+pub(super) enum NetworkCommandError {
     Spawn,
     TimedOut,
     Wait,
     Read,
 }
 
-async fn git_network_output<I, S>(directory: &Path, args: I) -> Result<Output, NetworkCommandError>
+pub(super) async fn git_network_output<I, S>(directory: &Path, args: I) -> Result<Output, NetworkCommandError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -527,7 +545,7 @@ async fn is_ancestor(root: &Path, older: &str, newer: &str) -> Result<bool, Team
     }
 }
 
-async fn has_operation_in_progress(root: &Path) -> Result<bool, TeamError> {
+pub(super) async fn has_operation_in_progress(root: &Path) -> Result<bool, TeamError> {
     let paths = [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",

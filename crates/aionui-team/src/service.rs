@@ -13,11 +13,11 @@ use aionui_api_types::{
     AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
     InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunResponse,
-    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRouting, TeamRunAckResponse,
-    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunIssueRequest,
+    TeamFreshRunIssueResponse, TeamFreshRunResponse, TeamInterruptAgentResponse, TeamMailboxMessageResponse,
+    TeamResponse, TeamRouting, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall, TeamToolContextResponse,
+    TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -2496,6 +2496,55 @@ impl TeamSessionService {
         team_id: &str,
         workspace: &str,
     ) -> Result<TeamFreshRunResponse, TeamError> {
+        self.fresh_run_with_pin(user_id, team_id, workspace, None).await
+    }
+
+    pub async fn fresh_run_issue(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        request: &TeamFreshRunIssueRequest,
+    ) -> Result<TeamFreshRunIssueResponse, TeamError> {
+        // Reject an invalid Team before creating a safe but unbound worktree.
+        self.load_owned_team(user_id, team_id).await?;
+        let project_service = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| TeamError::InvalidRequest("project workspace discovery is unavailable".to_owned()))?;
+        let prepared = crate::issue_workspace::prepare(
+            &project_service,
+            user_id,
+            &request.repository_full_name,
+            request.issue_number,
+            request.base_ref.as_deref(),
+        )
+        .await?;
+        let fresh = self
+            .fresh_run_with_pin(user_id, team_id, &prepared.workspace, Some(&prepared.base_sha))
+            .await?;
+        Ok(TeamFreshRunIssueResponse {
+            repository_full_name: prepared.repository_full_name,
+            issue_number: prepared.issue_number,
+            workspace: prepared.workspace,
+            branch: prepared.branch,
+            base_ref: prepared.base_ref,
+            base_sha: prepared.base_sha.clone(),
+            head_sha: prepared.base_sha,
+            reused: prepared.reused,
+            member_count: fresh.member_count,
+            cleared_context_anchors: fresh.cleared_context_anchors,
+        })
+    }
+
+    async fn fresh_run_with_pin(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        workspace: &str,
+        expected_head: Option<&str>,
+    ) -> Result<TeamFreshRunResponse, TeamError> {
         let gate = self.lifecycle_gate(team_id);
         let _lifecycle_guard = Arc::clone(&gate.lock).write_owned().await;
         let previous_generation = gate.generation.fetch_add(1, Ordering::AcqRel);
@@ -2506,7 +2555,7 @@ impl TeamSessionService {
             ));
         }
 
-        let result = self.fresh_run_inner(user_id, team_id, workspace).await;
+        let result = self.fresh_run_inner(user_id, team_id, workspace, expected_head).await;
         gate.generation.fetch_add(1, Ordering::AcqRel);
         result
     }
@@ -2516,6 +2565,7 @@ impl TeamSessionService {
         user_id: &str,
         team_id: &str,
         workspace: &str,
+        expected_head: Option<&str>,
     ) -> Result<TeamFreshRunResponse, TeamError> {
         let workspace = validate_create_workspace_path(workspace)?;
         let membership_lock = self
@@ -2539,6 +2589,9 @@ impl TeamSessionService {
         // Classify and refresh refs without changing the checkout first. Only
         // after ownership and active-run checks pass do we close enqueue access.
         let freshness = crate::fresh_run_workspace::inspect(&workspace).await?;
+        if let Some(expected_head) = expected_head {
+            crate::fresh_run_workspace::require_pinned_head(&freshness, expected_head)?;
+        }
         let quiesce_guard = session
             .as_ref()
             .map(|session| session.work_coordinator().quiesce_for_fresh_run())

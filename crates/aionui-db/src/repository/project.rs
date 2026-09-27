@@ -25,6 +25,9 @@ pub trait IProjectStore: Send + Sync {
     async fn get_folder(&self, folder_id: &str) -> Result<Option<FolderRow>, DbError>;
     async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError>;
 
+    /// Local workspace roots already known to this user through Project Explorer.
+    async fn list_workspace_folders(&self, user_id: &str) -> Result<Vec<FolderRow>, DbError>;
+
     /// The workspace entry (if any) of `user_id` whose folder is `folder_id`.
     /// At most one exists per owner (enforced by
     /// `UNIQUE(owner_user_id, folder_id) WHERE role = 'workspace'`).

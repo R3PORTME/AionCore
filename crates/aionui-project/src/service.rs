@@ -46,6 +46,16 @@ impl ProjectService {
         let _ = self.scm_roots_tx.set(tx);
     }
 
+    /// Return the user's persisted local workspace roots for deterministic
+    /// repository discovery. Non-file providers are not local Git candidates.
+    pub async fn list_local_workspace_paths(&self, user_id: &str) -> Result<Vec<PathBuf>, ProjectError> {
+        let folders = self.store.list_workspace_folders(user_id).await?;
+        Ok(folders
+            .into_iter()
+            .filter_map(|folder| canonical::uri_to_path(&folder.resource_uri).ok())
+            .collect())
+    }
+
     /// Tell the source-control actor that a project's attached-folder set changed,
     /// so it can recompute repositories and push a `repositoriesChanged` frame.
     ///
