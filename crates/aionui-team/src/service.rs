@@ -2526,13 +2526,28 @@ impl TeamSessionService {
         let membership_guard = membership_lock.lock().await;
         let team = self.load_owned_team(user_id, team_id).await?;
 
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
-            if session.team_run_manager().current_active_run_id().is_some() {
-                return Err(TeamError::InvalidRequest(
-                    "team has an active run; finish or cancel it before starting a fresh run".to_owned(),
-                ));
-            }
-            session.work_coordinator().quiesce_for_fresh_run()?;
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        if let Some(session) = &session
+            && session.team_run_manager().current_active_run_id().is_some()
+        {
+            return Err(TeamError::InvalidRequest(
+                "fresh_run_rejected (active_run): finish or cancel the active run before starting a fresh run"
+                    .to_owned(),
+            ));
+        }
+
+        // Classify and refresh refs without changing the checkout first. Only
+        // after ownership and active-run checks pass do we close enqueue access.
+        let freshness = crate::fresh_run_workspace::inspect(&workspace).await?;
+        let quiesce_guard = session
+            .as_ref()
+            .map(|session| session.work_coordinator().quiesce_for_fresh_run())
+            .transpose()?;
+        // A failed checkout update drops the guard, restoring each slot's exact
+        // prior runtime constraint before the lifecycle barrier is released.
+        crate::fresh_run_workspace::apply(freshness).await?;
+        if let Some(guard) = quiesce_guard {
+            guard.commit();
         }
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamContextReset)
