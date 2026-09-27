@@ -2112,6 +2112,101 @@ async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
 }
 
 #[tokio::test]
+async fn fresh_run_rejects_git_workspace_before_team_state_is_reset() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let original_workspace = data["workspace"].as_str().unwrap().to_owned();
+    let lead_id = data["assistants"][0]["conversation_id"].as_str().unwrap().to_owned();
+    let worker_id = data["assistants"][1]["conversation_id"].as_str().unwrap().to_owned();
+
+    let session_request = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    assert_eq!(
+        app.clone().oneshot(session_request).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('fresh-run-reject-message', ?, ?, 'lead-slot', 'message', 'old work', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][1]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('fresh-run-reject-task', ?, 'Old task', 'Old issue', 'completed', ?, '[]', '[]', '{}', 10, 20)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][0]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let workspace_path = workspace.path();
+    for args in [
+        vec!["init", "--quiet", "--initial-branch=main"],
+        vec!["config", "user.name", "Test User"],
+        vec!["config", "user.email", "test@example.invalid"],
+    ] {
+        let mut command = aionui_runtime::Builder::clean_cli("git");
+        command.args(args).current_dir(workspace_path).env("LC_ALL", "C");
+        assert!(command.output().await.unwrap().status.success());
+    }
+    std::fs::write(workspace_path.join("tracked.txt"), "initial\n").unwrap();
+    for args in [vec!["add", "tracked.txt"], vec!["commit", "--quiet", "-m", "initial"]] {
+        let mut command = aionui_runtime::Builder::clean_cli("git");
+        command.args(args).current_dir(workspace_path).env("LC_ALL", "C");
+        assert!(command.output().await.unwrap().status.success());
+    }
+    let fresh = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-run"),
+        json!({ "workspace": workspace_path.to_string_lossy() }),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(fresh).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(mailbox_count, 1);
+    assert_eq!(task_count, 1);
+
+    let team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(team.status(), StatusCode::OK);
+    let team = body_json(team).await;
+    assert_eq!(team["data"]["workspace"], original_workspace);
+    assert_eq!(team["data"]["assistants"][0]["conversation_id"], lead_id);
+    assert_eq!(team["data"]["assistants"][1]["conversation_id"], worker_id);
+}
+
+#[tokio::test]
 async fn fresh_run_requires_authentication() {
     let (mut app, services) = build_app().await;
     let (_, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

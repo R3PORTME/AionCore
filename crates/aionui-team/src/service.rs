@@ -2518,6 +2518,7 @@ impl TeamSessionService {
         workspace: &str,
     ) -> Result<TeamFreshRunResponse, TeamError> {
         let workspace = validate_create_workspace_path(workspace)?;
+        crate::fresh_run_workspace::ensure_fresh(&workspace).await?;
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())

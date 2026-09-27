@@ -7,6 +7,7 @@ pub mod crash_detection;
 pub mod error;
 pub mod event_loop;
 pub mod events;
+mod fresh_run_workspace;
 pub mod mailbox;
 pub mod mcp;
 mod member_runtime;
