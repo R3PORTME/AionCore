@@ -4,6 +4,7 @@ pub(crate) mod spawn_support;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
@@ -12,10 +13,11 @@ use aionui_api_types::{
     AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
     InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
-    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamFreshRunResponse,
+    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRouting, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -116,6 +118,20 @@ struct SessionEntry {
     slow_monitor_handle: tokio::task::JoinHandle<()>,
 }
 
+struct TeamLifecycleGate {
+    lock: Arc<tokio::sync::RwLock<()>>,
+    generation: AtomicU64,
+}
+
+impl Default for TeamLifecycleGate {
+    fn default() -> Self {
+        Self {
+            lock: Arc::new(tokio::sync::RwLock::new(())),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
 pub struct TeamIdleCleanupCoordinator {
     service: Arc<TeamSessionService>,
     active_leases: Arc<ActiveLeaseRegistry>,
@@ -166,6 +182,11 @@ pub struct TeamSessionService {
     backend_binary_path: Arc<PathBuf>,
     prompt_dump: TeamPromptDumpConfig,
     sessions: Arc<DashMap<String, SessionEntry>>,
+    /// Per-team lifecycle barrier. Normal work uses a shared admission guard;
+    /// fresh-run takes the exclusive guard and changes the generation so a
+    /// request that waited across an Issue boundary is rejected instead of
+    /// continuing in the rebuilt runtime.
+    lifecycle_gates: Arc<DashMap<String, Arc<TeamLifecycleGate>>>,
     /// Per-team mutex serializing membership mutations with session startup so
     /// callers cannot read-modify-write the `agents` JSON or rebuild a runtime
     /// session from a stale roster snapshot.
@@ -301,12 +322,43 @@ impl TeamSessionService {
             backend_binary_path,
             prompt_dump,
             sessions: Arc::new(DashMap::new()),
+            lifecycle_gates: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
+    }
+
+    fn lifecycle_gate(&self, team_id: &str) -> Arc<TeamLifecycleGate> {
+        self.lifecycle_gates
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(TeamLifecycleGate::default()))
+            .clone()
+    }
+
+    async fn acquire_lifecycle_admission(
+        &self,
+        team_id: &str,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, TeamError> {
+        let gate = self.lifecycle_gate(team_id);
+        let observed_generation = gate.generation.load(Ordering::Acquire);
+        if !observed_generation.is_multiple_of(2) {
+            return Err(TeamError::InvalidRequest(
+                "team fresh run is in progress; retry after it completes".to_owned(),
+            ));
+        }
+
+        let guard = Arc::clone(&gate.lock).read_owned().await;
+        let current_generation = gate.generation.load(Ordering::Acquire);
+        if current_generation != observed_generation || !current_generation.is_multiple_of(2) {
+            drop(guard);
+            return Err(TeamError::InvalidRequest(
+                "team lifecycle changed while the request was waiting; retry the request".to_owned(),
+            ));
+        }
+        Ok(guard)
     }
 
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
@@ -877,6 +929,7 @@ impl TeamSessionService {
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let team = self.load_owned_team(user_id, team_id).await?;
 
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
@@ -933,6 +986,7 @@ impl TeamSessionService {
     /// archived team stops streaming just like a deleted one; unarchiving
     /// cold-starts a fresh runtime.
     pub async fn stop_team_processes(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let team = self.load_owned_team(user_id, team_id).await?;
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::Archived)
             .await;
@@ -962,6 +1016,7 @@ impl TeamSessionService {
         team_id: &str,
         req: AddAgentRequest,
     ) -> Result<TeamAgentResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -1017,7 +1072,70 @@ impl TeamSessionService {
         self.build_agent_response(user_id, team_id, &agent).await
     }
 
+    pub async fn update_agent_routing(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        requested_routing: TeamRouting,
+    ) -> Result<TeamAgentResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let agent_index = team
+            .agents
+            .iter()
+            .position(|agent| agent.slot_id == slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let role = team.agents[agent_index].role;
+        let routing = TeamAgentProvisioner::validated_routing(role, Some(requested_routing))?;
+        let updated_agent = {
+            let agent = &mut team.agents[agent_index];
+            agent.routing = routing;
+            agent.clone()
+        };
+
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        if let Some(session) = &session {
+            // Fail before persistence if the published session cannot observe
+            // this roster slot. Membership mutations and session startup share
+            // this lock, so a successful database write can be applied in-place.
+            let live_agent = session.scheduler().get_agent(slot_id).await?;
+            if live_agent.role != role || live_agent.conversation_id != updated_agent.conversation_id {
+                return Err(TeamError::InvalidRequest(
+                    "active team session roster does not match the persisted member".into(),
+                ));
+            }
+        }
+
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(serde_json::to_string(&team.agents)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if let Some(session) = session {
+            session.update_agent_routing(slot_id, routing).await?;
+        }
+        info!(team_id, slot_id, routing = ?routing, "team agent routing updated");
+        drop(_guard);
+        drop(_lifecycle_guard);
+        self.build_agent_response(user_id, team_id, &updated_agent).await
+    }
+
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -1396,6 +1514,7 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team_row(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await
     }
@@ -2348,6 +2467,10 @@ impl TeamSessionService {
         context: &crate::tool_executor::TeamToolContext,
         call: TeamToolCall,
     ) -> Result<serde_json::Value, TeamToolErrorPayload> {
+        let _lifecycle_guard = self
+            .acquire_lifecycle_admission(&context.team_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?;
         let scheduler = self
             .get_session_scheduler(&context.team_id)
             .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
@@ -2367,7 +2490,136 @@ impl TeamSessionService {
         self.sessions.len()
     }
 
+    pub async fn fresh_run(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        workspace: &str,
+    ) -> Result<TeamFreshRunResponse, TeamError> {
+        let gate = self.lifecycle_gate(team_id);
+        let _lifecycle_guard = Arc::clone(&gate.lock).write_owned().await;
+        let previous_generation = gate.generation.fetch_add(1, Ordering::AcqRel);
+        if !previous_generation.is_multiple_of(2) {
+            gate.generation.fetch_add(1, Ordering::AcqRel);
+            return Err(TeamError::InvalidRequest(
+                "team lifecycle generation was already resetting".to_owned(),
+            ));
+        }
+
+        let result = self.fresh_run_inner(user_id, team_id, workspace).await;
+        gate.generation.fetch_add(1, Ordering::AcqRel);
+        result
+    }
+
+    async fn fresh_run_inner(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        workspace: &str,
+    ) -> Result<TeamFreshRunResponse, TeamError> {
+        let workspace = validate_create_workspace_path(workspace)?;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let membership_guard = membership_lock.lock().await;
+        let team = self.load_owned_team(user_id, team_id).await?;
+
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        if let Some(session) = &session
+            && session.team_run_manager().current_active_run_id().is_some()
+        {
+            return Err(TeamError::InvalidRequest(
+                "fresh_run_rejected (active_run): finish or cancel the active run before starting a fresh run"
+                    .to_owned(),
+            ));
+        }
+
+        // Classify and refresh refs without changing the checkout first. Only
+        // after ownership and active-run checks pass do we close enqueue access.
+        let freshness = crate::fresh_run_workspace::inspect(&workspace).await?;
+        let quiesce_guard = session
+            .as_ref()
+            .map(|session| session.work_coordinator().quiesce_for_fresh_run())
+            .transpose()?;
+        // A failed checkout update drops the guard, restoring each slot's exact
+        // prior runtime constraint before the lifecycle barrier is released.
+        crate::fresh_run_workspace::apply(freshness).await?;
+        if let Some(guard) = quiesce_guard {
+            guard.commit();
+        }
+
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamContextReset)
+            .await;
+
+        let mut cleared_context_anchors = 0usize;
+        for agent in &team.agents {
+            if self
+                .conversation_port
+                .clear_context_anchor(user_id, &agent.conversation_id)
+                .await?
+            {
+                cleared_context_anchors += 1;
+            }
+        }
+
+        // Rotate only the member conversation generation. Slot identity, role,
+        // assistant binding, model profile, and the previous conversation rows
+        // remain intact; the rebuilt Team points at blank conversations whose
+        // runtime state is seeded from the previous generation.
+        let mut fresh_agents = Vec::with_capacity(team.agents.len());
+        for agent in &team.agents {
+            let conversation_id = self
+                .conversation_port
+                .create_fresh_conversation_generation(user_id, &agent.conversation_id, &workspace)
+                .await?;
+            let mut fresh_agent = agent.clone();
+            fresh_agent.conversation_id = conversation_id;
+            fresh_agent.status = None;
+            fresh_agent.conversation_type = None;
+            fresh_agent.cli_path = None;
+            fresh_agents.push(fresh_agent);
+        }
+        let agents_json = serde_json::to_string(&fresh_agents)?;
+
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    workspace: Some(workspace.clone()),
+                    agents: Some(agents_json),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
+        self.repo.delete_tasks_by_team(user_id, team_id).await?;
+
+        info!(
+            team_id,
+            member_count = fresh_agents.len(),
+            cleared_context_anchors,
+            workspace = %workspace,
+            "team fresh run prepared"
+        );
+
+        // Keep the lifecycle barrier held across rebuild, but release the
+        // membership lock before ensure_session_inner reacquires it. The lock
+        // order is lifecycle -> membership, so this path cannot self-deadlock.
+        drop(membership_guard);
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
+
+        Ok(TeamFreshRunResponse {
+            workspace,
+            member_count: fresh_agents.len(),
+            cleared_context_anchors,
+        })
+    }
+
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.stop_session_unchecked(team_id);
         Ok(())
@@ -2498,6 +2750,7 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
@@ -2513,6 +2766,7 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
@@ -2527,6 +2781,7 @@ impl TeamSessionService {
         slot_id: &str,
         request: InterruptTeamAgentRequest,
     ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (message, files) = self
@@ -2558,9 +2813,10 @@ impl TeamSessionService {
         slot_id: &str,
         expected_batch_id: &str,
         message_ids: &[String],
+        truncated_message_ids: &[String],
     ) -> Result<ObserveMessagesResult, TeamError> {
         self.published_session(team_id)?
-            .observe_agent_messages(slot_id, expected_batch_id, message_ids)
+            .observe_agent_messages(slot_id, expected_batch_id, message_ids, truncated_message_ids)
             .await
     }
 
@@ -2600,6 +2856,7 @@ impl TeamSessionService {
     /// the background and any preserved unread mailbox rows are re-drained by
     /// the member's event loop via `reconcile_mailbox`.
     pub async fn attach_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -2634,6 +2891,7 @@ impl TeamSessionService {
     /// terminal outcome so callers only receive success once the runtime is
     /// ready.
     pub async fn restart_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.restart_agent_runtime_inner(user_id, team_id, slot_id, false).await
     }
 
@@ -2643,6 +2901,7 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.restart_agent_runtime_inner(user_id, team_id, slot_id, true).await
     }
 
@@ -2772,6 +3031,7 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
     ) -> Result<TeamContextResetResponse, TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.clear_agent_context_inner(user_id, team_id, slot_id).await
     }
 
@@ -3051,6 +3311,7 @@ impl TeamSessionService {
         target_slot_id: Option<String>,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -3071,6 +3332,7 @@ impl TeamSessionService {
         slot_id: &str,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -3091,6 +3353,7 @@ impl TeamSessionService {
         slot_id: &str,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
@@ -3104,6 +3367,7 @@ impl TeamSessionService {
     }
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
+        let _lifecycle_guard = self.acquire_lifecycle_admission(team_id).await?;
         let team = self.load_owned_team(user_id, team_id).await?;
         if let Some(starting_member) = team
             .agents
@@ -3254,7 +3518,8 @@ mod tests {
     };
     use aionui_api_types::{
         AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionRequest, SetConfigOptionResponse,
-        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
+        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRouting,
+        TeamRunTargetRole,
     };
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
@@ -3487,6 +3752,7 @@ mod tests {
                 aionui_api_types::TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3495,6 +3761,7 @@ mod tests {
                 aionui_api_types::TeamAgentInput {
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3510,6 +3777,7 @@ mod tests {
         request.agents.push(aionui_api_types::TeamAgentInput {
             name: "Butler".into(),
             role: "teammate".into(),
+            routing: None,
             backend: Some("aionrs".into()),
             model: "claude-sonnet".into(),
             assistant_id: None,
@@ -3642,6 +3910,61 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(assistant.conversation_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn routing_update_is_immediately_visible_to_team_members_in_active_session() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Routing Update"))
+            .await
+            .unwrap();
+        let teammate = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap()
+            .clone();
+        assert_eq!(teammate.routing, TeamRouting::Unassigned);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
+        let lead_slot_id = created.leader_assistant_id.as_deref().unwrap();
+        let updated = svc
+            .update_agent_routing(
+                "user-test",
+                &created.id,
+                &teammate.slot_id,
+                TeamRouting::ImplementationPrimary,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.routing, TeamRouting::ImplementationPrimary);
+
+        let live = session.scheduler().get_agent(&teammate.slot_id).await.unwrap();
+        assert_eq!(live.routing, TeamRouting::ImplementationPrimary);
+        assert_eq!(live.conversation_id, teammate.conversation_id);
+        let service = Arc::downgrade(&svc);
+        let members = crate::mcp::server::dispatch_tool(
+            "team_members",
+            &serde_json::json!({}),
+            session.scheduler(),
+            &service,
+            &created.id,
+            lead_slot_id,
+            crate::types::TeammateRole::Lead,
+        )
+        .await
+        .unwrap();
+        let members: serde_json::Value = serde_json::from_str(&members).unwrap();
+        let member = members
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["slot_id"] == teammate.slot_id)
+            .unwrap();
+        assert_eq!(member["routing"], "implementation_primary");
+        svc.stop_session("user-test", &created.id).await.unwrap();
     }
 
     #[tokio::test]
@@ -4643,6 +4966,7 @@ mod tests {
                 AddAgentRequest {
                     name: "Worker".to_owned(),
                     role: "teammate".to_owned(),
+                    routing: None,
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
                     assistant_id: None,
@@ -4718,6 +5042,7 @@ mod tests {
             AddAgentRequest {
                 name: "Worker".to_owned(),
                 role: "teammate".to_owned(),
+                routing: None,
                 backend: Some("acp".to_owned()),
                 model: "claude".to_owned(),
                 assistant_id: None,
@@ -4761,6 +5086,7 @@ mod tests {
                 AddAgentRequest {
                     name: "Worker".to_owned(),
                     role: "teammate".to_owned(),
+                    routing: None,
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
                     assistant_id: None,

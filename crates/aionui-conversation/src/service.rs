@@ -3047,6 +3047,160 @@ impl ConversationService {
         ))
     }
 
+    /// Create a blank conversation generation for a Team member while keeping
+    /// the previous conversation row and its visible history intact.
+    ///
+    /// The new row inherits the exact assistant snapshot and persisted ACP
+    /// model/mode/config selections, but never inherits the backend session id
+    /// or any messages. This gives Team fresh-run a hard Issue boundary without
+    /// destroying the previous Issue's audit trail.
+    pub async fn create_fresh_team_generation(
+        &self,
+        user_id: &str,
+        id: &str,
+        workspace: &str,
+    ) -> Result<String, ConversationError> {
+        let parent = self
+            .conversation_repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        if team_id_from_extra(&parent.extra).is_none() {
+            return Err(ConversationError::Forbidden {
+                reason: "fresh Team generations require a team-owned conversation".into(),
+            });
+        }
+
+        let acp_row = self
+            .acp_session_repo
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("acp_session lookup: {e}")))?;
+
+        let new_id = generate_short_id();
+        let now = now_ms();
+        let mut extra: serde_json::Value = serde_json::from_str(&parent.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid parent extra JSON: {e}")))?;
+        let previous_workspace = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some(obj) = extra.as_object_mut() {
+            obj.remove("fork");
+            obj.insert("workspace".to_owned(), serde_json::Value::String(workspace.to_owned()));
+            obj.insert(
+                "team_issue_previous_conversation_id".to_owned(),
+                serde_json::Value::String(id.to_owned()),
+            );
+        }
+        let same_workspace = previous_workspace.as_deref() == Some(workspace);
+
+        let row = ConversationRow {
+            id: new_id.clone(),
+            user_id: user_id.to_owned(),
+            name: parent.name.clone(),
+            r#type: parent.r#type.clone(),
+            extra: serde_json::to_string(&extra)
+                .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
+            model: parent.model.clone(),
+            status: Some(enum_to_db(&ConversationStatus::Pending)?),
+            source: parent.source.clone(),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: same_workspace.then(|| parent.project_id.clone()).flatten(),
+            folder_id: same_workspace.then(|| parent.folder_id.clone()).flatten(),
+            name_source: parent.name_source.clone(),
+        };
+        self.conversation_repo.create(&row).await?;
+
+        let setup_result: Result<(), ConversationError> = async {
+            if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(user_id, id).await? {
+                self.conversation_repo
+                    .upsert_assistant_snapshot(
+                        user_id,
+                        &UpsertConversationAssistantSnapshotParams {
+                            conversation_id: &new_id,
+                            assistant_definition_id: &snapshot.assistant_definition_id,
+                            assistant_id: &snapshot.assistant_id,
+                            assistant_source: &snapshot.assistant_source,
+                            agent_id: &snapshot.agent_id,
+                            rules_content: &snapshot.rules_content,
+                            default_model_mode: &snapshot.default_model_mode,
+                            resolved_model_id: snapshot.resolved_model_id.as_deref(),
+                            default_permission_mode: &snapshot.default_permission_mode,
+                            resolved_permission_value: snapshot.resolved_permission_value.as_deref(),
+                            default_thought_level_mode: &snapshot.default_thought_level_mode,
+                            resolved_thought_level_value: snapshot.resolved_thought_level_value.as_deref(),
+                            default_skills_mode: &snapshot.default_skills_mode,
+                            resolved_skill_ids: &snapshot.resolved_skill_ids,
+                            resolved_disabled_builtin_skill_ids: &snapshot.resolved_disabled_builtin_skill_ids,
+                            default_mcps_mode: &snapshot.default_mcps_mode,
+                            resolved_mcp_ids: &snapshot.resolved_mcp_ids,
+                        },
+                    )
+                    .await?;
+            }
+
+            if let Some(acp_row) = &acp_row {
+                self.acp_session_repo
+                    .create(&CreateAcpSessionParams {
+                        user_id,
+                        conversation_id: &new_id,
+                        agent_source: &acp_row.agent_source,
+                        agent_id: &acp_row.agent_id,
+                    })
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to create acp_session row: {e}")))?;
+
+                if let Some(state) = self
+                    .acp_session_repo
+                    .load_runtime_state_for_user(user_id, id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to load runtime state: {e}")))?
+                {
+                    let seed = SaveRuntimeStateParams {
+                        current_mode_id: state.current_mode_id.as_deref().map(Some),
+                        current_model_id: state.current_model_id.as_deref().map(Some),
+                        config_selections_json: state.config_selections_json.as_deref().map(Some),
+                        context_usage_json: None,
+                    };
+                    self.acp_session_repo
+                        .save_runtime_state_for_user(user_id, &new_id, &seed)
+                        .await
+                        .map_err(|e| ConversationError::internal(format!("Failed to seed runtime state: {e}")))?;
+                }
+            }
+
+            if !same_workspace {
+                self.bind_project_best_effort(user_id, &new_id, workspace).await;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = setup_result {
+            let _ = self.acp_session_repo.delete_for_user(user_id, &new_id).await;
+            let _ = self.conversation_repo.delete(user_id, &new_id).await;
+            return Err(error);
+        }
+
+        let source = parent
+            .source
+            .as_deref()
+            .and_then(|value| string_to_enum::<ConversationSource>(value).ok());
+        self.broadcast_list_changed(user_id, &new_id, "created", source.as_ref());
+        info!(
+            previous_conversation_id = %id,
+            conversation_id = %new_id,
+            workspace,
+            "Created fresh Team conversation generation"
+        );
+        Ok(new_id)
+    }
+
     /// Reset a conversation: clear messages and set status back to pending.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn reset(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {

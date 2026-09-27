@@ -159,6 +159,7 @@ mod tests {
             slot_id: "lead-1".into(),
             name: "Lead".into(),
             role: TeammateRole::Lead,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "conv-1".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -174,6 +175,7 @@ mod tests {
             slot_id: slot_id.into(),
             name: name.into(),
             role: TeammateRole::Teammate,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: format!("conv-{slot_id}"),
             backend: "acp".into(),
             model: "claude".into(),
@@ -253,10 +255,18 @@ mod tests {
     fn lead_prompt_contains_core_sections() {
         let assistants = default_assistants();
         let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
+        let normalized_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
 
         // Workflow uses tools for dynamic state.
         assert!(prompt.contains("## Workflow"));
         assert!(prompt.contains("FIRST call `team_members`"));
+        assert!(normalized_prompt.contains("a strict coordinator for coding work"));
+        assert!(normalized_prompt.contains("`Implement Issue #N`"));
+        assert!(normalized_prompt.contains(
+            "For every coding request, call `team_members` and inspect the current roster before assigning the work"
+        ));
+        assert!(normalized_prompt.contains("Consider existing teammates before proposing or using `team_spawn_agent`"));
+        assert!(normalized_prompt.contains("After dispatching actionable coding work, end your turn"));
         assert!(prompt.contains("call `team_list_assistants`"));
         assert!(prompt.contains("Wait for explicit confirmation before using team_spawn_agent"));
         assert!(prompt.contains("End your turn after the proposal"));
@@ -283,7 +293,7 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_task_list"));
         assert!(prompt.contains("team_rename_agent"));
-        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("Call `team_read_messages` once near the start of each active Team turn"));
         assert!(prompt.contains("`since_message_id`"));
         assert!(prompt.contains("`content_truncated: true`"));
     }

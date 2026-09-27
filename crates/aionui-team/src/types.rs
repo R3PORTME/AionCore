@@ -1,6 +1,8 @@
 use std::fmt;
 
-use aionui_api_types::{TeamAgentResponse, TeamContextResetAvailability, TeamContextResetCapability, TeamResponse};
+use aionui_api_types::{
+    TeamAgentResponse, TeamContextResetAvailability, TeamContextResetCapability, TeamResponse, TeamRouting,
+};
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +94,8 @@ pub struct TeamAgent {
     #[serde(alias = "agentName")]
     pub name: String,
     pub role: TeammateRole,
+    #[serde(default)]
+    pub routing: TeamRouting,
     #[serde(alias = "conversationId")]
     pub conversation_id: String,
     #[serde(alias = "agentType")]
@@ -126,6 +130,7 @@ impl TeamAgent {
             assistant_name: self.name.clone(),
             name: self.name.clone(),
             role: self.role.to_string(),
+            routing: self.routing,
             conversation_id: self.conversation_id.clone(),
             assistant_backend: self.backend.clone(),
             backend: self.backend.clone(),
@@ -285,7 +290,14 @@ use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 
 impl Team {
     pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
-        let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
+        let mut agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
+        // Old roster JSON predates routing. The lead role itself identifies a
+        // coordinator; legacy teammates have no inferred implementation lane.
+        for agent in &mut agents {
+            if agent.role == TeammateRole::Lead && agent.routing == TeamRouting::Unassigned {
+                agent.routing = TeamRouting::Coordinator;
+            }
+        }
         Ok(Self {
             id: row.id.clone(),
             name: row.name.clone(),
@@ -528,6 +540,7 @@ mod tests {
             slot_id: "s1".into(),
             name: "Lead".into(),
             role: TeammateRole::Lead,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -550,6 +563,7 @@ mod tests {
             slot_id: "s1".into(),
             name: "Lead".into(),
             role: TeammateRole::Lead,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "c1".into(),
             backend: "claude".into(),
             model: "opus".into(),
@@ -570,6 +584,7 @@ mod tests {
             slot_id: "s1".into(),
             name: "Worker".into(),
             role: TeammateRole::Teammate,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -589,6 +604,7 @@ mod tests {
             slot_id: "s1".into(),
             name: "A".into(),
             role: TeammateRole::Lead,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -633,6 +649,7 @@ mod tests {
             slot_id: "s1".into(),
             name: "Lead".into(),
             role: TeammateRole::Lead,
+            routing: aionui_api_types::TeamRouting::Unassigned,
             conversation_id: "c1".into(),
             backend: "acp".into(),
             model: "claude".into(),
@@ -665,6 +682,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_roster_defaults_without_name_or_model_inference() {
+        let row = TeamRow {
+            id: "t1".into(),
+            user_id: "u1".into(),
+            name: "Legacy".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
+            agents: serde_json::json!([
+                {"slot_id":"lead", "name":"Any", "role":"lead", "conversation_id":"c1", "backend":"any", "model":"any"},
+                {"slot_id":"worker", "name":"Primary", "role":"teammate", "conversation_id":"c2", "backend":"any", "model":"any"}
+            ]).to_string(),
+            lead_agent_id: Some("lead".into()),
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            created_at: 0,
+            updated_at: 0,
+            project_id: None,
+            folder_id: None,
+        };
+        let team = Team::from_row(&row).unwrap();
+        assert_eq!(team.agents[0].routing, TeamRouting::Coordinator);
+        assert_eq!(team.agents[1].routing, TeamRouting::Unassigned);
+    }
+
+    #[test]
     fn team_to_response() {
         let team = Team {
             id: "t1".into(),
@@ -674,6 +716,7 @@ mod tests {
                 slot_id: "s1".into(),
                 name: "Lead".into(),
                 role: TeammateRole::Lead,
+                routing: aionui_api_types::TeamRouting::Unassigned,
                 conversation_id: "c1".into(),
                 backend: "acp".into(),
                 model: "claude".into(),

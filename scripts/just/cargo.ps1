@@ -62,6 +62,11 @@ function Test-AionrsPatch {
 $status = 0
 try {
     if (-not [string]::IsNullOrWhiteSpace($env:AIONRS)) {
+        if ($CargoArgs -contains "--locked") {
+            [Console]::Error.WriteLine("AIONRS cannot be used with --locked publication checks because resolving a local SDK patch may change Cargo.lock. Unset AIONRS and rerun just push; use just lint/test for local SDK development.")
+            exit 1
+        }
+
         if (-not (Test-Path -LiteralPath $env:AIONRS -PathType Container)) {
             Write-Error "AIONRS does not exist or is not a directory: $env:AIONRS"
             exit 1

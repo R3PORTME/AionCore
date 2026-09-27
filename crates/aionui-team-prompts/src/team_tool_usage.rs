@@ -2,6 +2,8 @@ use aionui_api_types::{TeamToolDescriptor, TeamToolRole, TeamToolTransport};
 
 use crate::role_prompt::TeamPromptRole;
 
+const BROADCAST_GUIDANCE: &str = "Broadcasts: `team_send_message` with `to=\"*\"` wakes every recipient. Use broadcast only when every recipient needs actionable information now; never use broadcast merely to announce task completion. Prefer an exact `slot_id` when only one teammate needs the message.";
+
 pub fn build_team_tool_usage(role: TeamPromptRole, transport: TeamToolTransport) -> String {
     let tool_role = match role {
         TeamPromptRole::Lead => TeamToolRole::Lead,
@@ -26,9 +28,10 @@ then retry the MCP tool call with corrected arguments.\n\
 If the `team_*` MCP tools are unavailable, missing, disconnected, or continue to fail after correction,\n\
 use the Team CLI fallback through \"$AIONUI_HELPER_BIN\" team ... commands to continue Team coordination.\n\n\
 For exact schema, run team capabilities.\n\n\
-| When | MCP tool | Input summary |\n\
-| --- | --- | --- |\n",
+",
     );
+    text.push_str(BROADCAST_GUIDANCE);
+    text.push_str("\n\n| When | MCP tool | Input summary |\n| --- | --- | --- |\n");
     for tool in descriptors {
         text.push_str(&format!(
             "| {} | `{}` | {} |\n",
@@ -56,9 +59,10 @@ for all agent targets.\n\n\
 If the CLI returns schema_validation_failed, unknown_command, or permission_denied,\n\
 consult team capabilities or team help, correct the call, and retry at most once.\n\n\
 For exact schema, run team capabilities.\n\n\
-| When | CLI command | Canonical tool | Input summary |\n\
-| --- | --- | --- | --- |\n",
+",
     );
+    text.push_str(BROADCAST_GUIDANCE);
+    text.push_str("\n\n| When | CLI command | Canonical tool | Input summary |\n| --- | --- | --- | --- |\n");
     for tool in descriptors {
         text.push_str(&format!(
             "| {} | `team {}` | `{}` | {} |\n",
@@ -95,6 +99,23 @@ mod tests {
         assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team capabilities"));
         assert!(usage.contains("retry the MCP tool call with corrected arguments"));
         assert!(usage.contains("use the Team CLI fallback"));
+        assert!(usage.contains("`team_send_message` with `to=\"*\"` wakes every recipient"));
+        assert!(usage.contains("only when every recipient needs actionable information now"));
+        assert!(usage.contains("never use broadcast merely to announce task completion"));
+        let descriptor =
+            aionui_api_types::team_tool_descriptor("team_send_message").expect("send message tool descriptor");
+        assert!(descriptor.description.contains("wakes every recipient"));
+        assert!(
+            descriptor
+                .description
+                .contains("only when every recipient needs actionable information now")
+        );
+        assert!(
+            descriptor.input_schema["properties"]["to"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("wake every other team member")
+        );
     }
 
     #[test]

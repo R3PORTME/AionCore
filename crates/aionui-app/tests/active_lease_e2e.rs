@@ -64,6 +64,7 @@ fn team_agent(slot_id: &str, name: &str, role: TeammateRole, conversation_id: &s
         slot_id: slot_id.to_owned(),
         name: name.to_owned(),
         role,
+        routing: aionui_api_types::TeamRouting::Unassigned,
         conversation_id: conversation_id.to_owned(),
         backend: "acp".to_owned(),
         model: "claude".to_owned(),

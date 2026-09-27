@@ -14,7 +14,8 @@ When assistant rules conflict with Team collaboration, role, permission, task-bo
 
 Required Team behavior:
 - Use the Team tool interface provided in Team Tool Usage for all Team coordination.
-- Use `team_send_message` for Team reporting instead of ordinary assistant replies.
+- Team reporting means agent-to-agent coordination and reporting. Use `team_send_message` to communicate with teammates; do not mirror user-facing status or completion messages into the Team mailbox.
+- For routine status or completion reporting to the user, the Lead replies with an ordinary user-facing assistant response.
 - Use `team_task_update` and `team_task_list` for task-board state.
 - Follow role permissions. Lead-only tools cannot be used by teammates.
 - Domain-specific assistant rules, MCP servers, and skills remain active only inside these Team boundaries."#;

@@ -1787,6 +1787,7 @@ pub(crate) mod workspace_harness {
             agents: vec![aionui_api_types::TeamAgentInput {
                 name: "Lead".into(),
                 role: "lead".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,

@@ -1024,6 +1024,7 @@ dependencies = [
  "aionui-db",
  "aionui-project",
  "aionui-realtime",
+ "aionui-runtime",
  "aionui-team-prompts",
  "async-trait",
  "axum",

@@ -336,6 +336,229 @@ async fn tc4_explicit_lead_is_returned_first() {
     );
 }
 
+#[tokio::test]
+async fn routing_survives_create_add_list_get_and_fresh_run() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let body = two_agent_body();
+    let created = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/teams", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = body_json(created).await["data"].clone();
+    let team_id = created["id"].as_str().unwrap();
+    assert_eq!(created["assistants"][0]["routing"], "coordinator");
+    assert_eq!(created["assistants"][1]["routing"], "unassigned");
+    let original_workspace = created["workspace"].clone();
+    let original_agents = created["assistants"].as_array().unwrap().clone();
+    let worker_slot_id = created["assistants"][1]["slot_id"].as_str().unwrap();
+
+    let primary = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{worker_slot_id}/routing"),
+            json!({"routing": "implementation_primary"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let primary_status = primary.status();
+    let primary_body = body_json(primary).await;
+    assert_eq!(primary_status, StatusCode::OK, "{primary_body}");
+    assert_eq!(primary_body["data"]["routing"], "implementation_primary");
+
+    let added_body = team_agent("Escalation", "teammate");
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents"),
+            added_body,
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+    let escalation = body_json(added).await["data"].clone();
+    assert_eq!(escalation["routing"], "unassigned");
+    let escalation_slot_id = escalation["slot_id"].as_str().unwrap();
+    let escalation_update = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{escalation_slot_id}/routing"),
+            json!({"routing": "implementation_escalation"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(escalation_update.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(escalation_update).await["data"]["routing"],
+        "implementation_escalation"
+    );
+
+    let added = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents"),
+            team_agent("Reviewer", "teammate"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::CREATED);
+    let reviewer = body_json(added).await["data"].clone();
+    let reviewer_slot_id = reviewer["slot_id"].as_str().unwrap();
+    let review_update = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{reviewer_slot_id}/routing"),
+            json!({"routing": "independent_review"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(review_update.status(), StatusCode::OK);
+    assert_eq!(body_json(review_update).await["data"]["routing"], "independent_review");
+
+    let list = app.clone().oneshot(get_with_token("/api/teams", &token)).await.unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list = body_json(list).await;
+    let listed = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["id"] == team_id)
+        .unwrap();
+    assert_eq!(listed["assistants"][1]["routing"], "implementation_primary");
+    assert_eq!(listed["assistants"][2]["routing"], "implementation_escalation");
+    assert_eq!(listed["assistants"][3]["routing"], "independent_review");
+    for original in &original_agents {
+        let updated = listed["assistants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["slot_id"] == original["slot_id"])
+            .unwrap();
+        for identity_field in ["slot_id", "name", "role", "conversation_id", "assistant_id", "model"] {
+            assert_eq!(
+                updated[identity_field], original[identity_field],
+                "{identity_field} changed"
+            );
+        }
+    }
+    assert_eq!(listed["workspace"], original_workspace);
+
+    let workspace = std::env::temp_dir().join(format!("aionui-routing-fresh-{team_id}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let fresh_workspace = workspace.to_string_lossy().to_string();
+    let fresh = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({"workspace": fresh_workspace}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let got = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let got = body_json(got).await;
+    assert_eq!(got["data"]["assistants"][0]["routing"], "coordinator");
+    assert_eq!(got["data"]["assistants"][1]["routing"], "implementation_primary");
+    assert_eq!(got["data"]["assistants"][2]["routing"], "implementation_escalation");
+    assert_eq!(got["data"]["assistants"][3]["routing"], "independent_review");
+    assert_eq!(got["data"]["workspace"], fresh_workspace);
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn routing_rejects_role_mismatch() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let mut body = two_agent_body();
+    body["agents"][1]["routing"] = json!("coordinator");
+    let response = app
+        .oneshot(json_with_token("POST", "/api/teams", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = body_json(response).await;
+    assert!(response["error"].as_str().unwrap().contains("routing must match"));
+}
+
+#[tokio::test]
+async fn routing_update_rejects_invalid_roles_and_unauthenticated_requests() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
+    let created = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = created["id"].as_str().unwrap();
+    let lead_slot_id = created["assistants"][0]["slot_id"].as_str().unwrap();
+    let teammate_slot_id = created["assistants"][1]["slot_id"].as_str().unwrap();
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/teams/{team_id}/agents/{teammate_slot_id}/routing"),
+            json!({"routing": "implementation_primary"}),
+            "invalid-token",
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    for (slot_id, routing) in [
+        (teammate_slot_id, "coordinator"),
+        (lead_slot_id, "implementation_primary"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "PATCH",
+                &format!("/api/teams/{team_id}/agents/{slot_id}/routing"),
+                json!({"routing": routing}),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(body["error"].as_str().unwrap().contains("routing must match"));
+    }
+
+    let unchanged = app
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let unchanged = body_json(unchanged).await;
+    assert_eq!(unchanged["data"]["assistants"][0]["routing"], "coordinator");
+    assert_eq!(unchanged["data"]["assistants"][1]["routing"], "unassigned");
+}
+
 // TC-5: Empty agents returns 400
 #[tokio::test]
 async fn tc5_empty_agents_returns_error() {
@@ -1753,6 +1976,535 @@ async fn context_reset_requires_csrf() {
         .body(axum::body::Body::from("{}"))
         .unwrap();
     let resp = app.oneshot(missing_csrf).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn fresh_run_rebinds_workspace_and_rotates_blank_member_conversations() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead_conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+    let worker_conversation_id = data["assistants"][1]["conversation_id"].as_str().unwrap();
+
+    let ensure = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(ensure).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('fresh-run-message', ?, ?, 'lead-slot', 'message', 'old work', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][1]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('fresh-run-task', ?, 'Old task', 'Old issue', 'completed', ?, '[]', '[]', '{}', 10, 20)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][0]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    for (message_id, conversation_id, body) in [
+        ("fresh-run-lead-history", lead_conversation_id, "old lead issue"),
+        ("fresh-run-worker-history", worker_conversation_id, "old worker issue"),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, conversation_id, msg_id, type, content, position, status, hidden, created_at, backend_turn_id) \
+             VALUES (?, ?, ?, 'text', ?, 'left', 'finish', 0, 100, NULL)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(json!({ "content": body }).to_string())
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    }
+
+    let workspace = std::env::temp_dir().join(format!("aionui-team-fresh-run-{team_id}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace_string = workspace.to_string_lossy().to_string();
+    let fresh = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-run"),
+        json!({ "workspace": workspace_string.clone() }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(fresh).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["workspace"], workspace_string);
+    assert_eq!(body["data"]["member_count"], 2);
+
+    let team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(team.status(), StatusCode::OK);
+    let team = body_json(team).await;
+    assert_eq!(team["data"]["workspace"], workspace_string);
+
+    let fresh_lead_conversation_id = team["data"]["assistants"][0]["conversation_id"].as_str().unwrap();
+    let fresh_worker_conversation_id = team["data"]["assistants"][1]["conversation_id"].as_str().unwrap();
+    assert_ne!(fresh_lead_conversation_id, lead_conversation_id);
+    assert_ne!(fresh_worker_conversation_id, worker_conversation_id);
+
+    for (fresh_conversation_id, previous_conversation_id) in [
+        (fresh_lead_conversation_id, lead_conversation_id),
+        (fresh_worker_conversation_id, worker_conversation_id),
+    ] {
+        let extra = conversation_extra(&services, fresh_conversation_id).await;
+        assert_eq!(extra["workspace"], workspace_string);
+        assert_eq!(extra["team_issue_previous_conversation_id"], previous_conversation_id);
+    }
+
+    let old_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages \
+         WHERE id IN ('fresh-run-lead-history', 'fresh-run-worker-history') \
+           AND conversation_id IN (?, ?)",
+    )
+    .bind(lead_conversation_id)
+    .bind(worker_conversation_id)
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+    let fresh_history_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)")
+        .bind(fresh_lead_conversation_id)
+        .bind(fresh_worker_conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(old_history_count, 2, "previous Issue history must be preserved");
+    assert_eq!(fresh_history_count, 0, "new Issue conversations must start blank");
+
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(mailbox_count, 0);
+    assert_eq!(task_count, 0);
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+struct GitFreshRunFixture {
+    _remote: tempfile::TempDir,
+    remote_path: std::path::PathBuf,
+    workspace: tempfile::TempDir,
+}
+
+async fn fresh_run_git(cwd: &std::path::Path, args: &[&str]) -> String {
+    let mut command = aionui_runtime::Builder::clean_cli("git");
+    command.args(args).current_dir(cwd).env("LC_ALL", "C");
+    let output = command.output().await.expect("run Git fixture command");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+async fn fresh_run_git_fixture() -> GitFreshRunFixture {
+    let remote = tempfile::TempDir::new().unwrap();
+    let remote_path = remote.path().join("remote.git");
+    let remote_path_string = remote_path.to_string_lossy().to_string();
+    let mut command = aionui_runtime::Builder::clean_cli("git");
+    command.args([
+        "init",
+        "--bare",
+        "--quiet",
+        "--initial-branch=main",
+        &remote_path_string,
+    ]);
+    let output = command.output().await.expect("initialize fresh-run bare remote");
+    assert!(output.status.success());
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    fresh_run_git(workspace.path(), &["init", "--quiet", "--initial-branch=main"]).await;
+    fresh_run_git(workspace.path(), &["config", "user.name", "Fresh Run Test"]).await;
+    fresh_run_git(workspace.path(), &["config", "user.email", "fresh-run@example.invalid"]).await;
+    fresh_run_git(workspace.path(), &["remote", "add", "origin", &remote_path_string]).await;
+    std::fs::write(workspace.path().join("tracked.txt"), "initial\n").unwrap();
+    fresh_run_git(workspace.path(), &["add", "tracked.txt"]).await;
+    fresh_run_git(workspace.path(), &["commit", "--quiet", "-m", "initial"]).await;
+    fresh_run_git(
+        workspace.path(),
+        &["push", "--quiet", "--set-upstream", "origin", "main"],
+    )
+    .await;
+
+    GitFreshRunFixture {
+        _remote: remote,
+        remote_path,
+        workspace,
+    }
+}
+
+async fn publish_fresh_run_change(fixture: &GitFreshRunFixture, content: &str) -> String {
+    let publisher = tempfile::TempDir::new().unwrap();
+    let remote_path = fixture.remote_path.to_string_lossy().to_string();
+    fresh_run_git(publisher.path(), &["clone", "--quiet", &remote_path, "."]).await;
+    fresh_run_git(publisher.path(), &["config", "user.name", "Fresh Run Test"]).await;
+    fresh_run_git(publisher.path(), &["config", "user.email", "fresh-run@example.invalid"]).await;
+    std::fs::write(publisher.path().join("tracked.txt"), content).unwrap();
+    fresh_run_git(publisher.path(), &["add", "tracked.txt"]).await;
+    fresh_run_git(publisher.path(), &["commit", "--quiet", "-m", "publish change"]).await;
+    fresh_run_git(publisher.path(), &["push", "--quiet", "origin", "main"]).await;
+    fresh_run_git(publisher.path(), &["rev-parse", "HEAD"]).await
+}
+
+#[tokio::test]
+async fn fresh_run_admits_current_and_behind_git_workspaces_preserving_team_configuration() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let before_agents = data["assistants"].as_array().unwrap().clone();
+    let fixture = fresh_run_git_fixture().await;
+    let workspace = fixture.workspace.path().to_string_lossy().to_string();
+    let initial_head = fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await;
+
+    let current = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({ "workspace": workspace }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        initial_head
+    );
+    let advanced_head = publish_fresh_run_change(&fixture, "advanced\n").await;
+    let behind = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({ "workspace": workspace }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(behind.status(), StatusCode::OK);
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        advanced_head
+    );
+
+    {
+        let team = app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+            .await
+            .unwrap();
+        assert_eq!(team.status(), StatusCode::OK);
+        let team = body_json(team).await["data"].clone();
+        assert_eq!(team["workspace"], workspace);
+        assert_eq!(team["assistants"].as_array().unwrap().len(), before_agents.len());
+        for (actual, original) in team["assistants"].as_array().unwrap().iter().zip(&before_agents) {
+            for field in ["slot_id", "role", "assistant_id", "model", "routing"] {
+                assert_eq!(actual[field], original[field], "fresh-run changed {field}");
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap(),
+        "advanced\n"
+    );
+}
+
+#[tokio::test]
+async fn fresh_run_rejects_behind_git_workspace_during_active_run_without_partial_reset() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let original_agents = data["assistants"].as_array().unwrap().clone();
+    let fixture = fresh_run_git_fixture().await;
+    let original_head = fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await;
+    let original_content = std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap();
+    let _published = publish_fresh_run_change(&fixture, "must-not-be-checked-out\n").await;
+
+    let send = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/messages"),
+            json!({ "content": "active run", "files": [] }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(send.status(), StatusCode::OK);
+    let active_run_id = body_json(send).await["data"]["run"]["team_run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/fresh-run"),
+            json!({ "workspace": fixture.workspace.path().to_string_lossy() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"].as_str().unwrap().to_owned();
+    assert!(
+        error.contains("active_run"),
+        "expected active_run rejection, got {error}"
+    );
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        original_head
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap(),
+        original_content
+    );
+
+    let team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    let team = body_json(team).await["data"].clone();
+    for (actual, original) in team["assistants"].as_array().unwrap().iter().zip(&original_agents) {
+        assert_eq!(actual["slot_id"], original["slot_id"]);
+        assert_eq!(actual["conversation_id"], original["conversation_id"]);
+        assert_eq!(actual["routing"], original["routing"]);
+    }
+    let run_after = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}/run-state"), &token))
+        .await
+        .unwrap();
+    let run_after = body_json(run_after).await["data"]["active_run"].clone();
+    assert!(
+        run_after.is_null() || run_after["team_run_id"] == active_run_id,
+        "fresh-run changed an unrelated active run: {run_after}"
+    );
+
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        mailbox_count, 1,
+        "rejected fresh-run must preserve the active run's mailbox item"
+    );
+    assert_eq!(task_count, 0);
+}
+
+#[tokio::test]
+async fn fresh_run_rejects_git_workspace_before_team_state_is_reset() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let original_workspace = data["workspace"].as_str().unwrap().to_owned();
+    let lead_id = data["assistants"][0]["conversation_id"].as_str().unwrap().to_owned();
+    let worker_id = data["assistants"][1]["conversation_id"].as_str().unwrap().to_owned();
+
+    let session_request = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    assert_eq!(
+        app.clone().oneshot(session_request).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('fresh-run-reject-message', ?, ?, 'lead-slot', 'message', 'old work', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][1]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('fresh-run-reject-task', ?, 'Old task', 'Old issue', 'completed', ?, '[]', '[]', '{}', 10, 20)",
+    )
+    .bind(team_id)
+    .bind(data["assistants"][0]["slot_id"].as_str().unwrap())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let workspace_path = workspace.path();
+    for args in [
+        vec!["init", "--quiet", "--initial-branch=main"],
+        vec!["config", "user.name", "Test User"],
+        vec!["config", "user.email", "test@example.invalid"],
+    ] {
+        let mut command = aionui_runtime::Builder::clean_cli("git");
+        command.args(args).current_dir(workspace_path).env("LC_ALL", "C");
+        assert!(command.output().await.unwrap().status.success());
+    }
+    std::fs::write(workspace_path.join("tracked.txt"), "initial\n").unwrap();
+    for args in [vec!["add", "tracked.txt"], vec!["commit", "--quiet", "-m", "initial"]] {
+        let mut command = aionui_runtime::Builder::clean_cli("git");
+        command.args(args).current_dir(workspace_path).env("LC_ALL", "C");
+        assert!(command.output().await.unwrap().status.success());
+    }
+    let fresh = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/fresh-run"),
+        json!({ "workspace": workspace_path.to_string_lossy() }),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(fresh).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await["error"].as_str().unwrap().to_owned();
+    assert!(
+        error.contains("missing_upstream"),
+        "expected missing_upstream rejection, got {error}"
+    );
+
+    let mailbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_tasks WHERE team_id = ?")
+        .bind(team_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(mailbox_count, 1);
+    assert_eq!(task_count, 1);
+
+    let team = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(team.status(), StatusCode::OK);
+    let team = body_json(team).await;
+    assert_eq!(team["data"]["workspace"], original_workspace);
+    assert_eq!(team["data"]["assistants"][0]["conversation_id"], lead_id);
+    assert_eq!(team["data"]["assistants"][1]["conversation_id"], worker_id);
+}
+
+#[tokio::test]
+async fn fresh_run_rejects_missing_team_before_git_workspace_mutation() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let fixture = fresh_run_git_fixture().await;
+    let original_head = fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await;
+    let original_content = std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap();
+    let _published = publish_fresh_run_change(&fixture, "must-remain-unchecked-out\n").await;
+
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams/nonexistent/fresh-run",
+            json!({ "workspace": fixture.workspace.path().to_string_lossy() }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        fresh_run_git(fixture.workspace.path(), &["rev-parse", "HEAD"]).await,
+        original_head
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.path().join("tracked.txt")).unwrap(),
+        original_content
+    );
+    let team_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(team_count, 0);
+}
+
+#[tokio::test]
+async fn fresh_run_requires_authentication() {
+    let (mut app, services) = build_app().await;
+    let (_, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/nonexistent/fresh-run")
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn fresh_run_requires_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let workspace = std::env::current_dir().unwrap().to_string_lossy().to_string();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/teams/nonexistent/fresh-run")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(json!({ "workspace": workspace }).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 

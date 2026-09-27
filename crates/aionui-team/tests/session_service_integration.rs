@@ -2690,6 +2690,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
         TeamAgentInput {
             name: "Lead".into(),
             role: "lead".into(),
+            routing: None,
             backend: Some("acp".into()),
             model: "claude".into(),
             assistant_id: None,
@@ -2698,6 +2699,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
         TeamAgentInput {
             name: "Worker".into(),
             role: "teammate".into(),
+            routing: None,
             backend: Some("acp".into()),
             model: "claude".into(),
             assistant_id: None,
@@ -2720,6 +2722,7 @@ fn team_agent_input(name: &str, role: &str, model: &str) -> TeamAgentInput {
     TeamAgentInput {
         name: name.into(),
         role: role.into(),
+        routing: None,
         backend: Some("acp".into()),
         model: model.into(),
         assistant_id: None,
@@ -3022,6 +3025,7 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -3219,6 +3223,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: Some("assistant-lead".into()),
@@ -3289,6 +3294,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: Some("assistant-lead".into()),
@@ -3375,6 +3381,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some(String::new()),
                     model: "gpt-5".into(),
                     assistant_id: Some("assistant-lead".into()),
@@ -3461,6 +3468,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("gemini".into()),
                     model: "gpt-5".into(),
                     assistant_id: Some("assistant-lead".into()),
@@ -3528,6 +3536,7 @@ async fn team_preset_assistant_snapshot_is_frozen() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude-sonnet-4".into(),
                     assistant_id: Some("word-creator".into()),
@@ -3597,6 +3606,7 @@ async fn team_assistant_mcp_selection_wins_over_frozen_preset_defaults() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude-sonnet-4".into(),
                     assistant_id: Some("word-creator".into()),
@@ -3665,6 +3675,7 @@ async fn team_members_receive_only_their_own_assistant_mcp_binding() {
                     TeamAgentInput {
                         name: "Lead".into(),
                         role: "lead".into(),
+                        routing: None,
                         backend: None,
                         model: "claude-sonnet-4".into(),
                         assistant_id: Some("word-creator".into()),
@@ -3673,6 +3684,7 @@ async fn team_members_receive_only_their_own_assistant_mcp_binding() {
                     TeamAgentInput {
                         name: "Review".into(),
                         role: "teammate".into(),
+                        routing: None,
                         backend: None,
                         model: "claude-sonnet-4".into(),
                         assistant_id: Some("reviewer".into()),
@@ -3727,6 +3739,7 @@ async fn assistant_mcp_change_refreshes_dormant_idle_and_duplicate_revisions() {
                     TeamAgentInput {
                         name: "Lead".into(),
                         role: "lead".into(),
+                        routing: None,
                         backend: None,
                         model: "claude-sonnet-4".into(),
                         assistant_id: Some("word-creator".into()),
@@ -3735,6 +3748,7 @@ async fn assistant_mcp_change_refreshes_dormant_idle_and_duplicate_revisions() {
                     TeamAgentInput {
                         name: "Review".into(),
                         role: "teammate".into(),
+                        routing: None,
                         backend: None,
                         model: "claude-sonnet-4".into(),
                         assistant_id: Some("reviewer".into()),
@@ -3859,6 +3873,7 @@ async fn full_reconcile_recovers_a_binding_change_whose_event_was_never_delivere
                     TeamAgentInput {
                         name: "Lead".into(),
                         role: "lead".into(),
+                        routing: None,
                         backend: None,
                         model: "claude-sonnet-4".into(),
                         assistant_id: Some("word-creator".into()),
@@ -3867,6 +3882,7 @@ async fn full_reconcile_recovers_a_binding_change_whose_event_was_never_delivere
                     TeamAgentInput {
                         name: "Review".into(),
                         role: "teammate".into(),
+                        routing: None,
                         backend: None,
                         model: "claude-sonnet-4".into(),
                         assistant_id: Some("reviewer".into()),
@@ -3993,6 +4009,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
+                routing: None,
             },
         )
         .await
@@ -4026,6 +4043,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4044,6 +4062,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
             AddAgentRequest {
                 name: "Coder".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "codex".into(),
                 assistant_id: None,
@@ -4119,6 +4138,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4137,6 +4157,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some(String::new()),
                 model: "gpt-5".into(),
                 assistant_id: Some("assistant-worker".into()),
@@ -4213,6 +4234,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("claude".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4231,6 +4253,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("gemini".into()),
                 model: "gpt-5".into(),
                 assistant_id: Some("assistant-worker".into()),
@@ -4253,6 +4276,7 @@ async fn tc2_create_single_agent_team() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4280,6 +4304,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
                     TeamAgentInput {
                         name: "Worker".into(),
                         role: "teammate".into(),
+                        routing: None,
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
@@ -4288,6 +4313,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
                     TeamAgentInput {
                         name: "Lead".into(),
                         role: "lead".into(),
+                        routing: None,
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
@@ -4318,6 +4344,7 @@ async fn create_team_rejects_zero_leaders() {
                 agents: vec![TeamAgentInput {
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4343,6 +4370,7 @@ async fn create_team_rejects_multiple_leaders() {
                     TeamAgentInput {
                         name: "Lead A".into(),
                         role: "lead".into(),
+                        routing: None,
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
@@ -4351,6 +4379,7 @@ async fn create_team_rejects_multiple_leaders() {
                     TeamAgentInput {
                         name: "Lead B".into(),
                         role: "leader".into(),
+                        routing: None,
                         backend: Some("acp".into()),
                         model: "claude".into(),
                         assistant_id: None,
@@ -4376,6 +4405,7 @@ async fn create_team_rejects_unknown_role() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "captain".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4504,6 +4534,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4676,6 +4707,7 @@ async fn aa1_add_agent_to_team() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4694,6 +4726,7 @@ async fn aa1_add_agent_to_team() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -4724,6 +4757,7 @@ async fn manual_add_without_active_run_opens_system_lifecycle_run() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4743,6 +4777,7 @@ async fn manual_add_without_active_run_opens_system_lifecycle_run() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -4806,6 +4841,7 @@ async fn add_agent_rejects_leader_role() {
             AddAgentRequest {
                 name: "Second Leader".into(),
                 role: "lead".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -4847,6 +4883,7 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
             AddAgentRequest {
                 name: name.into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: Some("word-creator".into()),
@@ -4892,6 +4929,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4914,6 +4952,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -4970,6 +5009,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -4993,6 +5033,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5145,6 +5186,7 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5164,6 +5206,7 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
             AddAgentRequest {
                 name: "Broken".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5259,6 +5302,7 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5281,6 +5325,7 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
             AddAgentRequest {
                 name: "Broken".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5356,6 +5401,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5375,6 +5421,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
             AddAgentRequest {
                 name: "Attaching".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5436,6 +5483,7 @@ async fn aa_add_agent_inherits_team_workspace() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5454,6 +5502,7 @@ async fn aa_add_agent_inherits_team_workspace() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5482,6 +5531,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5506,6 +5556,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5536,6 +5587,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5562,6 +5614,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5597,6 +5650,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5619,6 +5673,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5647,6 +5702,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -5676,6 +5732,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5739,6 +5796,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
             AddAgentRequest {
                 name: "Extra".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -5783,6 +5841,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("future-acp".into()),
                     model: "model-x".into(),
                     assistant_id: None,
@@ -5827,6 +5886,7 @@ async fn aa4_add_agent_to_nonexistent_team() {
             AddAgentRequest {
                 name: "X".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -6449,6 +6509,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("assistant-worker".into()),
+        routing: Some(aionui_api_types::TeamRouting::ImplementationEscalation),
     };
 
     let spawned = svc
@@ -6457,6 +6518,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
         .expect("spawn without active Team Run should still succeed");
     assert_eq!(spawned.name, "Helper");
     assert_eq!(spawned.assistant_id.as_deref(), Some("assistant-worker"));
+    assert_eq!(spawned.routing, aionui_api_types::TeamRouting::ImplementationEscalation);
 
     let after = svc
         .get_team("user1", &created.id)
@@ -6470,6 +6532,15 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
     assert!(
         after.assistants.iter().any(|agent| agent.slot_id == spawned.slot_id),
         "spawned teammate must be visible in persisted team state"
+    );
+    assert_eq!(
+        after
+            .assistants
+            .iter()
+            .find(|agent| agent.slot_id == spawned.slot_id)
+            .unwrap()
+            .routing,
+        aionui_api_types::TeamRouting::ImplementationEscalation
     );
 }
 
@@ -6507,6 +6578,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
+                routing: None,
             },
         )
         .await
@@ -6664,6 +6736,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
+        routing: None,
     };
 
     let err = svc
@@ -6710,6 +6783,7 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
     let req = SpawnAgentRequest {
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
+        routing: None,
     };
 
     let err = svc
@@ -7307,6 +7381,7 @@ async fn direct_cli_ensure_session_persists_team_mcp_stdio_config_for_every_desc
                     agents: vec![TeamAgentInput {
                         name: "Lead".into(),
                         role: "lead".into(),
+                        routing: None,
                         backend: Some(backend.into()),
                         model: backend.into(),
                         assistant_id: None,
@@ -7383,6 +7458,7 @@ async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_sessio
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -7519,6 +7595,7 @@ async fn stopped_session_rejects_late_attach_completion() {
             AddAgentRequest {
                 name: "Worker".into(),
                 role: "teammate".into(),
+                routing: None,
                 backend: Some("acp".into()),
                 model: "claude".into(),
                 assistant_id: None,
@@ -7745,6 +7822,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -7773,6 +7851,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
                 AddAgentRequest {
                     name: "Worker".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -7920,6 +7999,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
                     role: "lead".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -7941,6 +8021,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 AddAgentRequest {
                     name: "WorkerA".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -7959,6 +8040,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 AddAgentRequest {
                     name: "WorkerB".into(),
                     role: "teammate".into(),
+                    routing: None,
                     backend: Some("acp".into()),
                     model: "claude".into(),
                     assistant_id: None,
@@ -8443,6 +8525,7 @@ async fn agent_triggered_attach_failure_notifies_leader() {
             SpawnAgentRequest {
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
+                routing: None,
             },
         )
         .await

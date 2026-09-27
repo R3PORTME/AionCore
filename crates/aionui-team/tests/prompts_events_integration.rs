@@ -99,6 +99,7 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
         slot_id: slot_id.into(),
         name: name.into(),
         role,
+        routing: aionui_api_types::TeamRouting::Unassigned,
         conversation_id: format!("conv-{slot_id}"),
         backend: "acp".into(),
         model: "claude".into(),
@@ -364,7 +365,7 @@ fn lp3_lead_prompt_contains_task_management_guidance() {
         "missing decompose guidance"
     );
     assert!(
-        prompt.contains("assigning a task to a teammate") && prompt.contains("automatically notifies and wakes"),
+        prompt.contains("Assigning a task to a teammate") && prompt.contains("automatically notifies and wakes"),
         "missing task-assignment auto-notify/wake guidance"
     );
     assert!(prompt.contains("dependency"), "missing dependency guidance");
